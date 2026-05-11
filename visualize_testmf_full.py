@@ -468,6 +468,46 @@ class MultiModelSAEVisualizerTestMF:
             activation_map = sparse_features[0, idx, :, :].cpu()
             top_features.append((idx.item(), importance.item(), activation_map))
 
+        # ------------------------------------------------------------------
+        # Sum-of-features maps:
+        #   z_sum_all_map: sum over ALL D features (what the constraint sees)
+        #   z_sum_topk_map: sum over only the displayed top-k features
+        # Both are L1-normalized per-map (sum to 1) for direct visual
+        # comparison with the (also L1-normalized) Grad-CAM map.
+        # We also compute the cosine similarity between each sum and the
+        # Grad-CAM map -- that's the scalar "how well did the constraint
+        # work" diagnostic.
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            z_sum_all = sparse_features[0].sum(dim=0).cpu()       # [H, W]
+            z_sum_topk = torch.zeros_like(z_sum_all)
+            for _, _, m in top_features:
+                z_sum_topk = z_sum_topk + m
+
+            # L1-normalize both for display
+            def _l1_normalize(m):
+                s = m.sum()
+                if s.abs() > 1e-8:
+                    return m / s
+                return m
+
+            z_sum_all_n = _l1_normalize(z_sum_all)
+            z_sum_topk_n = _l1_normalize(z_sum_topk)
+            # Grad-CAM map was already normalized for display in
+            # _select_channels_and_gradcam_map -- min-max to [0,1]. Re-normalize
+            # to sum-1 for fair cosine comparison.
+            gc_n = _l1_normalize(gradcam_map.clone())
+
+            # Cosine similarity (treat maps as flat vectors)
+            def _cos(a, b):
+                a = a.flatten(); b = b.flatten()
+                na = a.norm().clamp(min=1e-8)
+                nb = b.norm().clamp(min=1e-8)
+                return float((a @ b) / (na * nb))
+
+            cos_all = _cos(z_sum_all_n, gc_n)
+            cos_topk = _cos(z_sum_topk_n, gc_n)
+
         true_class = list(IMAGENET2012_CLASSES.values())[label]
         pred_class = list(IMAGENET2012_CLASSES.values())[pred_label]
 
@@ -480,9 +520,14 @@ class MultiModelSAEVisualizerTestMF:
             'correct': (label == pred_label),
             'num_selected_channels': num_selected,
             'channel_weights': channel_weights.cpu(),
-            'gradcam_map': gradcam_map,                # H x W grad-cam heatmap
+            'gradcam_map': gradcam_map,                # H x W grad-cam heatmap (min-max [0,1])
             'top_features': top_features,
-            'feature_importance': feature_importance.cpu()
+            'feature_importance': feature_importance.cpu(),
+            # NEW: sum-of-z diagnostics
+            'z_sum_all_map': z_sum_all_n,              # sum over ALL D features, L1-normalized
+            'z_sum_topk_map': z_sum_topk_n,            # sum over the displayed top-k, L1-normalized
+            'z_sum_all_cos': cos_all,                  # cosine sim vs Grad-CAM
+            'z_sum_topk_cos': cos_topk,
         }
 
         # ------------------------------------------------------------------
@@ -566,16 +611,16 @@ class MultiModelSAEVisualizerTestMF:
         num_selected = results['num_selected_channels']
 
         n_features = len(top_features)
-        n_cols = 8
+        n_cols = 10  # was 8; +2 cols to fit a Sum-of-z panel in the overview row
         n_feature_rows = (n_features + 3) // 4
         has_feature_input = 'feature_id' in results
         # 1 overview row + feature rows + (optionally) 1 input-channel sub-row
         n_rows = 1 + n_feature_rows + (1 if has_feature_input else 0)
 
-        fig = plt.figure(figsize=(24, 3.5 * n_rows))
+        fig = plt.figure(figsize=(28, 3.5 * n_rows))
         gs = fig.add_gridspec(n_rows, n_cols, hspace=0.5, wspace=0.3)
 
-        # ===== Row 0: Input image | Grad-CAM | Info | Importance =====
+        # ===== Row 0: Input image | Grad-CAM | Sum-of-z | Info | Importance =====
         ax_img = fig.add_subplot(gs[0, 0:2])
         ax_img.imshow(image)
         ax_img.set_title("Test Image", fontsize=12, fontweight='bold')
@@ -584,32 +629,59 @@ class MultiModelSAEVisualizerTestMF:
         ax_gc = fig.add_subplot(gs[0, 2:4])
         ax_gc.imshow(gradcam_map.numpy(), cmap='jet', interpolation='bilinear')
         ax_gc.set_title("Grad-CAM Heatmap\n(target for sum of features)",
-                        fontsize=11, fontweight='bold')
-        ax_gc.axis('off')
+                        fontsize=11, fontweight='bold', color='royalblue')
+        for spine in ax_gc.spines.values():
+            spine.set_edgecolor('royalblue')
+            spine.set_linewidth(2)
+            spine.set_visible(True)
+        ax_gc.set_xticks([])
+        ax_gc.set_yticks([])
 
-        ax_info = fig.add_subplot(gs[0, 4:6])
+        # NEW: Sum-of-z panel (sum over all D features, L1-normalized)
+        ax_sum = fig.add_subplot(gs[0, 4:6])
+        z_sum_all = results['z_sum_all_map']
+        cos_all = results['z_sum_all_cos']
+        ax_sum.imshow(z_sum_all.numpy(), cmap='jet', interpolation='bilinear')
+        if cos_all >= 0.8:
+            sum_color = 'forestgreen'
+        elif cos_all >= 0.5:
+            sum_color = 'darkorange'
+        else:
+            sum_color = 'firebrick'
+        for spine in ax_sum.spines.values():
+            spine.set_edgecolor(sum_color)
+            spine.set_linewidth(2)
+            spine.set_visible(True)
+        ax_sum.set_title(f"Sum of z (all D)\ncos vs Grad-CAM = {cos_all:.3f}",
+                         fontsize=11, fontweight='bold', color=sum_color)
+        ax_sum.set_xticks([])
+        ax_sum.set_yticks([])
+
+        ax_info = fig.add_subplot(gs[0, 6:8])
         ax_info.axis('off')
 
         status = "CORRECT" if correct else "WRONG"
         info_text = f"Prediction: {status}\n"
-        info_text += f"  True: {true_class[:36]}...\n" if len(true_class) > 36 else f"  True: {true_class}\n"
-        info_text += f"  Pred: {pred_class[:36]}...\n\n" if len(pred_class) > 36 else f"  Pred: {pred_class}\n\n"
+        info_text += f"  True: {true_class[:30]}...\n" if len(true_class) > 30 else f"  True: {true_class}\n"
+        info_text += f"  Pred: {pred_class[:30]}...\n\n" if len(pred_class) > 30 else f"  Pred: {pred_class}\n\n"
         info_text += f"Backbone: {self.model_name}\n"
         info_text += f"  - {self.num_channels} input channels\n"
         info_text += f"  - {self.csae_model.hidden_dim} CSAE features\n"
         info_text += f"  - Top-k: {self.csae_model.top_k}\n"
-        info_text += f"  - GradCAM: {num_selected}/{self.num_channels} channels"
+        info_text += f"  - GradCAM: {num_selected}/{self.num_channels} channels\n"
+        info_text += f"  - Sum(z) cos vs GC: {results['z_sum_all_cos']:.3f}\n"
+        info_text += f"  - Sum(top-k z) cos vs GC: {results['z_sum_topk_cos']:.3f}"
         if has_feature_input:
             info_text += f"\n  - Queried feature: F{results['feature_id']}"
             info_text += f"\n  - Input view: {results['input_channel_view']}"
 
-        ax_info.text(0.05, 0.5, info_text, fontsize=9, family='monospace',
+        ax_info.text(0.05, 0.5, info_text, fontsize=8, family='monospace',
                     verticalalignment='center', transform=ax_info.transAxes,
                     bbox=dict(boxstyle='round',
                              facecolor='lightgreen' if correct else 'lightcoral',
                              alpha=0.3))
 
-        ax_bar = fig.add_subplot(gs[0, 6:])
+        ax_bar = fig.add_subplot(gs[0, 8:])
         importances = [imp for _, imp, _ in top_features]
         feature_indices = [f"F{idx}" for idx, _, _ in top_features]
         bar_colors = ['crimson' if has_feature_input and idx == results['feature_id']
@@ -815,7 +887,8 @@ class MultiModelSAEVisualizerTestMF:
         # With feature_id: same total columns; the input row reuses the same
         # column structure (feature recap in cols 0..1, input channels spread
         # across cols 2..total_cols).
-        total_cols = max(1 + n_features_per_image, 16)
+        # +1 extra column for the [Sum of z] panel beside Grad-CAM.
+        total_cols = max(2 + n_features_per_image, 16)
 
         col_width = 1.7
         fig_width = max(28, total_cols * col_width)
@@ -900,8 +973,10 @@ class MultiModelSAEVisualizerTestMF:
             feat_row = 1 + img_idx * rows_per_image
             top_features = results['top_features'][:n_features_per_image]
             gradcam_map = results['gradcam_map']
+            z_sum_all = results['z_sum_all_map']
+            cos_all = results['z_sum_all_cos']
 
-            # Column 0: Grad-CAM heatmap
+            # Column 0: Grad-CAM heatmap (the target)
             ax_gc = fig.add_subplot(gs[feat_row, 0])
             ax_gc.imshow(gradcam_map.numpy(), cmap='jet', interpolation='bilinear')
             for spine in ax_gc.spines.values():
@@ -914,9 +989,29 @@ class MultiModelSAEVisualizerTestMF:
             ax_gc.set_xticks([])
             ax_gc.set_yticks([])
 
-            # Columns 1..k: top feature maps
+            # Column 1: Sum of ALL z features (what the constraint pushes toward Grad-CAM)
+            ax_sum = fig.add_subplot(gs[feat_row, 1])
+            ax_sum.imshow(z_sum_all.numpy(), cmap='jet', interpolation='bilinear')
+            # Color the border by how close to Grad-CAM the sum is
+            # cos in [-1, 1]; with both maps non-negative it lives in [0, 1]
+            if cos_all >= 0.8:
+                sum_color = 'forestgreen'
+            elif cos_all >= 0.5:
+                sum_color = 'darkorange'
+            else:
+                sum_color = 'firebrick'
+            for spine in ax_sum.spines.values():
+                spine.set_edgecolor(sum_color)
+                spine.set_linewidth(2.5)
+                spine.set_visible(True)
+            ax_sum.set_title(f"Sum of z\ncos={cos_all:.2f}",
+                            fontsize=9, fontweight='bold', color=sum_color)
+            ax_sum.set_xticks([])
+            ax_sum.set_yticks([])
+
+            # Columns 2..k+1: top feature maps
             for feat_pos, (f_idx, importance, activation_map) in enumerate(top_features):
-                col = 1 + feat_pos
+                col = 2 + feat_pos
                 if col >= total_cols:
                     break
 
@@ -967,14 +1062,16 @@ class MultiModelSAEVisualizerTestMF:
                 )
 
         # Title
+        avg_cos = float(np.mean([r['z_sum_all_cos'] for r in all_results]))
         title = (f'Feature Consistency ({self.model_name}): '
                  f'Class {label} ({class_name[:40]}...)\n'
-                 f'Each row: [Grad-CAM | top-{n_features_per_image} features]')
+                 f'Each row: [Grad-CAM | Sum-of-z | top-{n_features_per_image} features]  --  '
+                 f'avg cos(Sum z, Grad-CAM) = {avg_cos:.3f}')
         if has_feature_id:
-            title += (f' -- queried F{feature_id} in crimson, '
-                      f'plus per-image input-channel sub-row beneath')
+            title += (f'\nQueried F{feature_id} in crimson, '
+                      f'per-image input-channel sub-row beneath')
         else:
-            title += f' -- {len(common_features)} common features in green'
+            title += f'  --  {len(common_features)} common features in green'
         plt.suptitle(title, fontsize=14, fontweight='bold', y=0.998)
 
         if save_path:
