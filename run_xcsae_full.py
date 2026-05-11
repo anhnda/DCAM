@@ -302,8 +302,17 @@ class GradCAMDecompositionLoss(nn.Module):
             z_sum_n = z_sum_flat / z_norm
             gc_n = gc_flat / gc_norm
 
-            loss = ((z_sum_n - gc_n) ** 2).mean()
+            # Sum squared error over spatial cells, mean over batch.
+            # This is the correct scaling for "MSE between two probability
+            # distributions over H*W cells": dividing by H*W (i.e. using .mean())
+            # makes the loss vanish as resolution grows, even when the two
+            # distributions are entirely different. With .sum(dim=1).mean()
+            # the loss is O(1e-3) and comparable to the reconstruction loss,
+            # giving the optimizer a real signal.
+            loss = ((z_sum_n - gc_n) ** 2).sum(dim=1).mean()
         else:
+            # Raw MSE (use only if you know z_sum and gradcam_map are already
+            # on a comparable scale).
             loss = ((z_sum - gradcam_map) ** 2).mean()
 
         return loss
@@ -1243,7 +1252,7 @@ def main():
                 displayed_loss = loss.item() * args.accumulation_steps
                 print(f"\rEpoch {epoch+1}/{args.epochs} [{batch_idx}/{len(train_loader)}] "
                       f"Loss: {displayed_loss:.4f} | Recon: {loss_recon.item():.4f} | "
-                      f"GradCAM: {loss_gradcam.item():.5f} | "
+                      f"GradCAM: {loss_gradcam.item():.6f} | "
                       f"Active: {active_pct:.1f}%", end="")
 
         avg_metrics = {k: v / n_batches for k, v in epoch_metrics.items()}
