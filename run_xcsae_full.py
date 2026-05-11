@@ -1,53 +1,44 @@
 """
 Multi-Model ConvSAE Training Script on Full ImageNet-1k
-(Masked Loss Variant with Multiple Backbone Support)
+(Masked Loss + Grad-CAM Decomposition Constraint Variant)
+
+NEW IN THIS VERSION:
+====================
+Adds a Grad-CAM Decomposition Constraint so that the spatial sum of the sparse
+latent features z equals (approximately) the Grad-CAM heatmap:
+
+    sum_d z_d(x)  ≈  L_GradCAM(x)        (spatially, H x W)
+
+This converts each active feature z_d into an interpretable, additive
+sub-pattern: the Grad-CAM heatmap literally decomposes as a sum of meaningful
+spatial patterns z_1 + z_2 + ... + z_D, exactly matching the framing of DCAM
+(Decomposed Class Activation Maps).
+
+Concretely, we:
+  1. During activation extraction, also compute and cache the spatial Grad-CAM
+     map L_GradCAM = ReLU(sum_k alpha_k * A_k)  of shape (H, W) per image,
+     normalized so its sum equals 1 (probability-like) -- gives a stable target
+     regardless of class/image scale.
+  2. Add a new loss term
+            L_gradcam = MSE( sum_d z_d ,  L_GradCAM_normalized )
+     where sum_d z_d is also rescaled to sum to 1 per sample so the constraint
+     is scale-invariant.
+  3. Add LAMBDA_GRADCAM (default 1.0) to control the strength of this term.
+
+Cache compatibility: this version uses a new cache key suffix ("gcmap1") so old
+caches will be ignored automatically.
 
 Supports multiple backbone architectures:
-- ResNet50 (default): layer3, 1024 channels, 14×14 resolution
-- ResNet18: layer3, 256 channels, 14×14 resolution
-- VGG16: features[16], 256 channels, 28×28 resolution
-- EfficientNet-B0: features[4], ~80 channels, 14×14 resolution
-
-Key Design:
-- Input: ALL activation channels (no pre-masking)
-- CSAE: Processes all channels with two-level sparsity
-- Loss: Reconstruction error computed ONLY on top 85% GradCAM-selected channels
-
-Dataset:
-- Full ImageNet-1k (1000 classes)
-- Samples 50 images per class from training set (50,000 total)
-- Caches sampled dataset to /data/imagenet1k_sampled for reuse
+- ResNet50 (default): layer3, 1024 channels, 14x14 resolution
+- ResNet18: layer3, 256 channels, 14x14 resolution
+- VGG16: features[16], 256 channels, 28x28 resolution
+- EfficientNet-B0: features[4], ~80 channels, 14x14 resolution
 
 Usage:
-    # ResNet50 (default, auto-adjusted batch_size=16)
     python run_xcsae_full.py
-
-    # ResNet18 (auto-adjusted batch_size=32)
     python run_xcsae_full.py --model resnet18
-
-    # VGG16
-    python run_xcsae_full.py --model vgg16
-
-    # EfficientNet-B0
-    python run_xcsae_full.py --model efficientnet
-
-    # Custom target layer for ResNet50
-    python run_xcsae_full.py --model resnet50 --target_layer layer2
-
-    # Gradient accumulation (batch_size=8, accumulation=4, effective=32)
-    python run_xcsae_full.py --model resnet50 --batch_size 8 --accumulation_steps 4
-
-    # Force resample dataset
-    python run_xcsae_full.py --force_resample
-
-    # Force re-extract activations (ignore cache)
-    python run_xcsae_full.py --force_reextract
-
-Memory Management:
-    - Batch size is auto-adjusted based on model size
-    - Use --accumulation_steps to train with larger effective batch sizes
-    - ResNet50: default batch_size=16 (fits on 16GB GPU)
-    - For OOM errors, reduce batch_size or increase accumulation_steps
+    python run_xcsae_full.py --lambda_gradcam 1.0
+    python run_xcsae_full.py --force_reextract     # re-extract to populate gradcam maps
 """
 
 import torch
@@ -84,48 +75,43 @@ from full_classes import IMAGENET2012_CLASSES
 # Configuration
 # ==========================================
 
-# Paths
 IMAGENET_RAW_DIR = Path("/data/imagenet_raw/data")
 IMAGENET_SAMPLED_DIR = Path("/data/imagenet1k_sampled")
 ACTIVATION_CACHE_DIR = Path("cache_activations")
 
-# Sampling parameters
-IMAGES_PER_CLASS = 50  # 50 images × 1000 classes = 50,000 images
+IMAGES_PER_CLASS = 50
 NUM_CLASSES = 1000
 
-# Memory management
 ACTIVATION_BATCH_SIZE = 500
 ACTIVATION_CHUNK_SIZE = 100
 
-# Training parameters
 BATCH_SIZE_COLLECTION = 32
 BATCH_SIZE_TRAIN = 32
 
-# Model configurations
 MODEL_CONFIGS = {
     'resnet50': {
         'model_fn': lambda: models.resnet50(pretrained=True),
         'default_target_layer': 'layer3',
         'valid_layers': ['layer1', 'layer2', 'layer3', 'layer4'],
-        'description': 'ResNet50 (layer3: 1024ch, 14×14)'
+        'description': 'ResNet50 (layer3: 1024ch, 14x14)'
     },
     'resnet18': {
         'model_fn': lambda: models.resnet18(pretrained=True),
         'default_target_layer': 'layer3',
         'valid_layers': ['layer1', 'layer2', 'layer3', 'layer4'],
-        'description': 'ResNet18 (layer3: 256ch, 14×14)'
+        'description': 'ResNet18 (layer3: 256ch, 14x14)'
     },
     'vgg16': {
         'model_fn': lambda: models.vgg16(pretrained=True),
         'default_target_layer': 'features[16]',
         'valid_layers': ['features[10]', 'features[16]', 'features[23]', 'features[30]'],
-        'description': 'VGG16 (features[16]: 256ch, 28×28)'
+        'description': 'VGG16 (features[16]: 256ch, 28x28)'
     },
     'efficientnet': {
         'model_fn': lambda: models.efficientnet_b0(pretrained=True),
         'default_target_layer': 'features[4]',
         'valid_layers': ['features[2]', 'features[3]', 'features[4]', 'features[5]'],
-        'description': 'EfficientNet-B0 (features[4]: ~80ch, 14×14)'
+        'description': 'EfficientNet-B0 (features[4]: ~80ch, 14x14)'
     }
 }
 
@@ -266,6 +252,64 @@ class FeatureChannelSparsityLoss(nn.Module):
 
 
 # ==========================================
+# NEW: Grad-CAM Decomposition Loss
+# ==========================================
+
+class GradCAMDecompositionLoss(nn.Module):
+    """Constrains the spatial sum of latent features z to match the Grad-CAM map.
+
+    We want: sum_d z_d(x) approx L_GradCAM(x)   (both H x W).
+
+    To make this scale-invariant, we normalize BOTH sides to sum to 1 (or have
+    unit L1 norm) per sample. This means each z_d becomes an additive,
+    proportional sub-component of the overall Grad-CAM attention -- so the
+    Grad-CAM heatmap really IS the sum of the discovered sub-patterns.
+
+    Args:
+        eps: small constant for numerical stability when normalizing.
+        normalize: if True, normalize both maps to sum to 1 per-sample before
+                   computing MSE (scale-invariant). If False, use raw MSE
+                   (requires the Grad-CAM target to already be on a comparable
+                   scale to z's activations).
+    """
+
+    def __init__(self, eps: float = 1e-8, normalize: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.normalize = normalize
+
+    def forward(self, sparse_features: torch.Tensor,
+                gradcam_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            sparse_features: [B, D, H, W] latent feature maps (post Top-K, post ReLU)
+            gradcam_map:     [B, H, W]    target Grad-CAM map (already non-negative)
+        Returns:
+            scalar MSE loss between sum_d z_d and gradcam_map.
+        """
+        # Sum over the feature-dimension D --> [B, H, W]
+        z_sum = sparse_features.sum(dim=1)
+
+        if self.normalize:
+            # Per-sample L1 normalization (so both maps sum to 1)
+            B = z_sum.shape[0]
+            z_sum_flat = z_sum.view(B, -1)
+            gc_flat = gradcam_map.view(B, -1)
+
+            z_norm = z_sum_flat.sum(dim=1, keepdim=True).clamp(min=self.eps)
+            gc_norm = gc_flat.sum(dim=1, keepdim=True).clamp(min=self.eps)
+
+            z_sum_n = z_sum_flat / z_norm
+            gc_n = gc_flat / gc_norm
+
+            loss = ((z_sum_n - gc_n) ** 2).mean()
+        else:
+            loss = ((z_sum - gradcam_map) ** 2).mean()
+
+        return loss
+
+
+# ==========================================
 # ImageNet-1k Dataset Sampler
 # ==========================================
 
@@ -349,7 +393,7 @@ class ImageNet1kSampledDataset(Dataset):
             'wnid_to_idx': self.wnid_to_idx,
             'idx_to_wnid': self.idx_to_wnid
         }, self.metadata_path)
-        print(f"✓ Sampled dataset cached!")
+        print(f"Sampled dataset cached!")
 
     def load_cached_dataset(self):
         """Load cached sampled dataset."""
@@ -376,11 +420,11 @@ class ImageNet1kSampledDataset(Dataset):
 
 
 # ==========================================
-# Multi-Model Activation Extractor
+# Multi-Model Activation Extractor (with Grad-CAM map caching)
 # ==========================================
 
 class MultiModelActivationExtractor:
-    """Extracts activation channels from various backbone models WITHOUT masking."""
+    """Extracts activation channels AND the spatial Grad-CAM map per image."""
 
     def __init__(self, model_name: str = 'resnet18', target_layer: str = None,
                  device='cuda', cumulative_threshold=0.85, cache_dir: Path = None):
@@ -390,7 +434,6 @@ class MultiModelActivationExtractor:
         self.cache_dir = cache_dir or ACTIVATION_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get model configuration
         if model_name not in MODEL_CONFIGS:
             raise ValueError(f"Unknown model: {model_name}. Choose from {list(MODEL_CONFIGS.keys())}")
 
@@ -398,20 +441,17 @@ class MultiModelActivationExtractor:
         self.target_layer_name = target_layer if target_layer else config['default_target_layer']
 
         print(f"\n{'='*80}")
-        print(f"Initializing {model_name.upper()} Activation Extractor")
+        print(f"Initializing {model_name.upper()} Activation Extractor (with Grad-CAM map caching)")
         print(f"{'='*80}")
         print(f"Model: {config['description']}")
         print(f"Target layer: {self.target_layer_name}")
         print(f"Cache directory: {self.cache_dir}")
 
-        # Load model
         self.model = config['model_fn']().to(device)
         self.model.eval()
 
-        # Get target layer
         self.target_layer = self._get_layer_by_name(self.target_layer_name)
 
-        # Get dimensions
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 224, 224).to(device)
             dummy_output = self._forward_to_target_layer(dummy_input)
@@ -419,59 +459,49 @@ class MultiModelActivationExtractor:
             self.spatial_size = dummy_output.shape[2]
 
         print(f"  Output channels: {self.num_channels}")
-        print(f"  Spatial resolution: {self.spatial_size}×{self.spatial_size}")
+        print(f"  Spatial resolution: {self.spatial_size}x{self.spatial_size}")
 
-        # GradCAM
         self.gradcam = GradCAM(self.model, self.target_layer)
 
-        # Hook
         self.activations = None
         self.target_layer.register_forward_hook(self._save_activation)
 
-        print(f"✓ Extractor ready!")
+        print(f"Extractor ready!")
 
     def _get_layer_by_name(self, layer_name: str):
-        """Get layer by name (e.g., 'layer3' or 'features[16]')."""
-        if '[' in layer_name:  # features[16] style
+        if '[' in layer_name:
             parts = layer_name.split('[')
             attr_name = parts[0]
             index = int(parts[1].rstrip(']'))
             return getattr(self.model, attr_name)[index]
-        else:  # layer3 style
+        else:
             return getattr(self.model, layer_name)
 
     def _forward_to_target_layer(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass up to target layer."""
         if self.model_name in ['resnet50', 'resnet18']:
             x = self.model.conv1(x)
             x = self.model.bn1(x)
             x = self.model.relu(x)
             x = self.model.maxpool(x)
             x = self.model.layer1(x)
-
             if 'layer1' in self.target_layer_name:
                 return x
-
             x = self.model.layer2(x)
             if 'layer2' in self.target_layer_name:
                 return x
-
             x = self.model.layer3(x)
             if 'layer3' in self.target_layer_name:
                 return x
-
             x = self.model.layer4(x)
             return x
 
         elif self.model_name == 'vgg16':
-            # Parse features[X]
             target_idx = int(self.target_layer_name.split('[')[1].rstrip(']'))
             for i in range(target_idx + 1):
                 x = self.model.features[i](x)
             return x
 
         elif self.model_name == 'efficientnet':
-            # Parse features[X]
             target_idx = int(self.target_layer_name.split('[')[1].rstrip(']'))
             for i in range(target_idx + 1):
                 x = self.model.features[i](x)
@@ -480,13 +510,26 @@ class MultiModelActivationExtractor:
         return x
 
     def _save_activation(self, module, input, output):
-        """Forward hook to save activations."""
         self.activations = output.detach()
 
-    def _select_channels_with_gradcam(self, image: torch.Tensor, class_idx: int = None) -> Tuple[torch.Tensor, int]:
-        """Use GradCAM to select important channels and create a binary mask."""
-        weights, _, pred_class = self.gradcam.forward(image, class_idx=class_idx, verbose=False)
+    def _select_channels_and_gradcam_map(self, image: torch.Tensor,
+                                          class_idx: int = None
+                                          ) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        """Use GradCAM to:
+          (1) select important channels (binary mask), and
+          (2) compute the spatial Grad-CAM heatmap L_GradCAM = ReLU(sum_k alpha_k A_k)
+              of shape (H, W), normalized to sum to 1 per image.
 
+        Returns:
+            channel_mask:   [C] bool tensor of selected channels
+            num_selected:   int, number of channels selected
+            gradcam_map:    [H, W] float tensor, non-negative, summing to 1
+        """
+        weights, _, pred_class = self.gradcam.forward(image, class_idx=class_idx, verbose=False)
+        # weights: [C], the alpha_k values from Grad-CAM
+        # self.activations: [1, C, H, W] (captured by the forward hook during gradcam.forward)
+
+        # --- Channel mask selection (unchanged logic) ---
         sorted_indices = torch.argsort(weights, descending=True)
         sorted_weights = weights[sorted_indices]
 
@@ -502,32 +545,48 @@ class MultiModelActivationExtractor:
         selected_channels = sorted_indices[:num_selected]
         channel_mask[selected_channels] = True
 
-        return channel_mask, num_selected
+        # --- Build the spatial Grad-CAM map ---
+        # L_GradCAM = ReLU( sum_k alpha_k * A_k )    shape: [H, W]
+        # self.activations is [1, C, H, W]; weights is [C]
+        with torch.no_grad():
+            acts = self.activations[0]                       # [C, H, W]
+            # Weighted sum over channels with the GradCAM alphas
+            weighted = (weights.view(-1, 1, 1) * acts).sum(dim=0)  # [H, W]
+            gradcam_map = F.relu(weighted)                   # non-negative
+
+            # Per-image L1 normalization so the map sums to 1
+            s = gradcam_map.sum()
+            if s > 1e-8:
+                gradcam_map = gradcam_map / s
+            else:
+                # degenerate case: uniform map
+                gradcam_map = torch.full_like(gradcam_map,
+                                              1.0 / gradcam_map.numel())
+
+        return channel_mask, num_selected, gradcam_map
 
     def _generate_cache_key(self, num_samples: int, chunk_size: int) -> str:
-        """Generate a unique cache key based on extraction configuration."""
-        # Create a string with all relevant parameters
+        """Cache key. The 'gcmap1' suffix marks this version (with Grad-CAM maps)
+        so existing caches without gradcam maps are not reused."""
         config_str = (
             f"{self.model_name}_"
             f"{self.target_layer_name}_"
             f"thresh{self.cumulative_threshold}_"
             f"samples{num_samples}_"
-            f"chunk{chunk_size}"
+            f"chunk{chunk_size}_"
+            f"gcmap1"
         )
-
-        # Clean up special characters for filename
         config_str = config_str.replace('[', '_').replace(']', '').replace('.', 'p')
-
         return config_str
 
     def _get_cache_path(self, cache_key: str) -> Path:
-        """Get the cache file path for a given cache key."""
         return self.cache_dir / f"activations_{cache_key}.pkl"
 
     def _save_chunk_part(self, cache_key: str, part_idx: int,
                         activation_chunk: torch.Tensor,
                         mask_chunk: torch.Tensor,
-                        label_chunk: torch.Tensor):
+                        label_chunk: torch.Tensor,
+                        gradcam_chunk: torch.Tensor):
         """Save a single chunk part to disk (incremental saving)."""
         cache_dir = self.cache_dir / cache_key
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -537,13 +596,13 @@ class MultiModelActivationExtractor:
         part_data = {
             'activation': activation_chunk,
             'mask': mask_chunk,
-            'label': label_chunk
+            'label': label_chunk,
+            'gradcam_map': gradcam_chunk,
         }
 
         joblib.dump(part_data, part_path, compress=3)
 
     def _save_activations_to_cache(self, cache_key: str, metadata: Dict):
-        """Save metadata for cached activations (chunks already saved incrementally)."""
         cache_dir = self.cache_dir / cache_key
         metadata_path = cache_dir / "metadata.pkl"
 
@@ -552,30 +611,27 @@ class MultiModelActivationExtractor:
 
         joblib.dump(metadata, metadata_path, compress=3)
 
-        # Calculate total cache size
         total_size = sum(f.stat().st_size for f in cache_dir.glob("*.pkl"))
         cache_size_mb = total_size / (1024 * 1024)
         print(f"  Total cache size: {cache_size_mb:.1f} MB")
         print(f"  Number of parts: {metadata['num_chunks']}")
-        print(f"✓ Activations cached!")
+        print(f"Activations + Grad-CAM maps cached!")
 
-    def _load_activations_from_cache(self, cache_key: str) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], Dict]:
-        """Load cached activations incrementally from multi-file cache."""
+    def _load_activations_from_cache(self, cache_key: str):
         cache_dir = self.cache_dir / cache_key
         metadata_path = cache_dir / "metadata.pkl"
 
         print(f"\n{'='*80}")
-        print(f"Loading cached activations...")
+        print(f"Loading cached activations + Grad-CAM maps...")
         print(f"{'='*80}")
         print(f"  Cache directory: {cache_dir}")
 
-        # Load metadata
         metadata = joblib.load(metadata_path)
 
-        # Load chunks incrementally
         activation_chunks = []
         mask_chunks = []
         label_chunks = []
+        gradcam_chunks = []
 
         num_parts = metadata['num_chunks']
         print(f"  Loading {num_parts} chunks incrementally...")
@@ -591,8 +647,15 @@ class MultiModelActivationExtractor:
             activation_chunks.append(part_data['activation'])
             mask_chunks.append(part_data['mask'])
             label_chunks.append(part_data['label'])
+            # Backward-compat: if old cache part lacks gradcam_map, fail loudly
+            if 'gradcam_map' not in part_data:
+                raise KeyError(
+                    f"Cache part {part_path} has no 'gradcam_map'. "
+                    "This cache predates the Grad-CAM decomposition constraint. "
+                    "Run with --force_reextract to rebuild the cache."
+                )
+            gradcam_chunks.append(part_data['gradcam_map'])
 
-            # Clear memory periodically
             if (part_idx + 1) % 50 == 0:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -604,12 +667,11 @@ class MultiModelActivationExtractor:
         print(f"\n  Total samples: {total_samples}")
         print(f"  Number of chunks: {len(activation_chunks)}")
         print(f"  Cache size: {cache_size_mb:.1f} MB")
-        print(f"✓ Cached activations loaded!")
+        print(f"Cached activations + Grad-CAM maps loaded!")
 
-        return activation_chunks, mask_chunks, label_chunks, metadata
+        return activation_chunks, mask_chunks, label_chunks, gradcam_chunks, metadata
 
     def _check_cache_exists(self, cache_key: str) -> bool:
-        """Check if cache exists for the given cache key."""
         cache_dir = self.cache_dir / cache_key
         metadata_path = cache_dir / "metadata.pkl"
         return metadata_path.exists()
@@ -620,54 +682,44 @@ class MultiModelActivationExtractor:
         normalize: bool = True,
         chunk_size: int = 100,
         use_cache: bool = True
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Collect activation maps in memory-efficient chunks with caching support.
-
-        Args:
-            data_loader: DataLoader for the dataset
-            normalize: Whether to apply robust normalization
-            chunk_size: Number of samples per chunk
-            use_cache: If True, load from cache if available, save to cache after extraction
+    ):
+        """Collect activations + Grad-CAM maps in memory-efficient chunks.
 
         Returns:
-            Tuple of (activation_chunks, mask_chunks, label_chunks)
-            Each is a list of tensors to avoid memory explosion from concatenation.
+            (activation_chunks, mask_chunks, label_chunks, gradcam_chunks)
         """
-        # Calculate total samples for cache key
         num_samples = len(data_loader.dataset)
         cache_key = self._generate_cache_key(num_samples, chunk_size)
 
-        # Check if cache exists and use_cache is True
         if use_cache and self._check_cache_exists(cache_key):
-            activation_chunks, mask_chunks, label_chunks, metadata = self._load_activations_from_cache(cache_key)
+            (activation_chunks, mask_chunks, label_chunks,
+             gradcam_chunks, metadata) = self._load_activations_from_cache(cache_key)
 
-            # Verify metadata matches current configuration
             if (metadata.get('normalized') == normalize and
                 metadata.get('cumulative_threshold') == self.cumulative_threshold):
                 print(f"  Metadata validated - cache is compatible!")
-                return activation_chunks, mask_chunks, label_chunks
+                return activation_chunks, mask_chunks, label_chunks, gradcam_chunks
             else:
                 print(f"  WARNING: Cache metadata mismatch, re-extracting...")
-                print(f"    Cached normalized={metadata.get('normalized')}, current={normalize}")
-                print(f"    Cached threshold={metadata.get('cumulative_threshold')}, current={self.cumulative_threshold}")
 
-        # Cache miss or invalid - extract activations
         all_activations = []
         all_masks = []
         all_labels = []
+        all_gradcams = []
         chunk_activations = []
         chunk_masks = []
         chunk_labels = []
+        chunk_gradcams = []
         channel_selection_stats = []
         total_processed = 0
         chunk_idx = 0
 
-        print(f"\nCollecting activation maps (chunked processing)...")
+        print(f"\nCollecting activation maps + Grad-CAM maps (chunked)...")
         print(f"  Chunk size: {chunk_size} images")
         print(f"  GradCAM threshold: {self.cumulative_threshold * 100:.0f}%")
         print(f"  Caching: {'Enabled (incremental)' if use_cache else 'Disabled'}")
 
-        for images, labels in tqdm(data_loader, desc="Extracting activations"):
+        for images, labels in tqdm(data_loader, desc="Extracting"):
             for i in range(images.size(0)):
                 image = images[i:i+1].to(self.device)
                 label = labels[i:i+1]
@@ -676,21 +728,23 @@ class MultiModelActivationExtractor:
                     _ = self.model(image)
                     activations = self.activations.clone()
 
-                channel_mask, num_selected = self._select_channels_with_gradcam(image)
+                # NEW: also compute Grad-CAM spatial map
+                channel_mask, num_selected, gradcam_map = \
+                    self._select_channels_and_gradcam_map(image)
                 channel_selection_stats.append(num_selected)
 
                 chunk_activations.append(activations.cpu())
                 chunk_masks.append(channel_mask.cpu())
                 chunk_labels.append(label)
+                chunk_gradcams.append(gradcam_map.cpu().unsqueeze(0))  # [1, H, W]
                 total_processed += 1
 
                 if len(chunk_activations) >= chunk_size:
-                    # Concatenate chunk
                     act_chunk = torch.cat(chunk_activations, dim=0)
                     mask_chunk = torch.stack(chunk_masks, dim=0)
                     label_chunk = torch.cat(chunk_labels, dim=0)
+                    gradcam_chunk = torch.cat(chunk_gradcams, dim=0)  # [chunk, H, W]
 
-                    # Normalize chunk if needed (before saving to ensure cache has normalized data)
                     if normalize:
                         for c in range(act_chunk.shape[1]):
                             channel_data = act_chunk[:, c, :, :]
@@ -702,19 +756,21 @@ class MultiModelActivationExtractor:
                                     channel_data = torch.clamp(channel_data, min=0.0, max=scale_factor)
                                     act_chunk[:, c, :, :] = channel_data / (scale_factor + 1e-8)
 
-                    # Save to cache immediately (incremental saving)
                     if use_cache:
-                        self._save_chunk_part(cache_key, chunk_idx, act_chunk, mask_chunk, label_chunk)
+                        self._save_chunk_part(cache_key, chunk_idx,
+                                              act_chunk, mask_chunk,
+                                              label_chunk, gradcam_chunk)
 
-                    # Add to list for return
                     all_activations.append(act_chunk)
                     all_masks.append(mask_chunk)
                     all_labels.append(label_chunk)
+                    all_gradcams.append(gradcam_chunk)
 
                     chunk_idx += 1
                     chunk_activations = []
                     chunk_masks = []
                     chunk_labels = []
+                    chunk_gradcams = []
 
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -724,8 +780,8 @@ class MultiModelActivationExtractor:
             act_chunk = torch.cat(chunk_activations, dim=0)
             mask_chunk = torch.stack(chunk_masks, dim=0)
             label_chunk = torch.cat(chunk_labels, dim=0)
+            gradcam_chunk = torch.cat(chunk_gradcams, dim=0)
 
-            # Normalize chunk if needed
             if normalize:
                 for c in range(act_chunk.shape[1]):
                     channel_data = act_chunk[:, c, :, :]
@@ -737,27 +793,28 @@ class MultiModelActivationExtractor:
                             channel_data = torch.clamp(channel_data, min=0.0, max=scale_factor)
                             act_chunk[:, c, :, :] = channel_data / (scale_factor + 1e-8)
 
-            # Save to cache immediately
             if use_cache:
-                self._save_chunk_part(cache_key, chunk_idx, act_chunk, mask_chunk, label_chunk)
+                self._save_chunk_part(cache_key, chunk_idx,
+                                      act_chunk, mask_chunk,
+                                      label_chunk, gradcam_chunk)
 
             all_activations.append(act_chunk)
             all_masks.append(mask_chunk)
             all_labels.append(label_chunk)
+            all_gradcams.append(gradcam_chunk)
 
-        # Calculate statistics WITHOUT concatenating all data
         total_samples = sum(chunk.shape[0] for chunk in all_activations)
         avg_selected = np.mean(channel_selection_stats)
         std_selected = np.std(channel_selection_stats)
 
-        print(f"\nCollection complete (memory-efficient chunked format):")
+        print(f"\nCollection complete:")
         print(f"  Total samples: {total_samples}")
         print(f"  Number of chunks: {len(all_activations)}")
-        print(f"  Average channels selected: {avg_selected:.1f} ± {std_selected:.1f} (out of {self.num_channels})")
+        print(f"  Average channels selected: {avg_selected:.1f} +/- {std_selected:.1f} (out of {self.num_channels})")
         if normalize and len(all_activations) > 0:
-            print(f"  Normalized range (sample from chunk 0): [{all_activations[0].min():.4f}, {all_activations[0].max():.4f}]")
+            print(f"  Activation range (chunk 0): [{all_activations[0].min():.4f}, {all_activations[0].max():.4f}]")
+            print(f"  Grad-CAM map sum (chunk 0): mean={all_gradcams[0].sum(dim=(1,2)).mean():.4f} (target=1.0)")
 
-        # Save metadata to cache if enabled (chunks already saved incrementally)
         if use_cache:
             metadata = {
                 'model_name': self.model_name,
@@ -769,15 +826,13 @@ class MultiModelActivationExtractor:
                 'avg_channels_selected': avg_selected,
                 'std_channels_selected': std_selected,
                 'total_samples': total_samples,
-                'num_chunks': len(all_activations)
+                'num_chunks': len(all_activations),
+                'has_gradcam_map': True,
             }
 
-            self._save_activations_to_cache(
-                cache_key=cache_key,
-                metadata=metadata
-            )
+            self._save_activations_to_cache(cache_key=cache_key, metadata=metadata)
 
-        return all_activations, all_masks, all_labels
+        return all_activations, all_masks, all_labels, all_gradcams
 
 
 # ==========================================
@@ -793,37 +848,35 @@ def masked_reconstruction_loss(reconstruction: torch.Tensor,
     masked_squared_error = squared_error * masks_4d
 
     num_selected = masks.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-    loss_per_sample = masked_squared_error.sum(dim=(1, 2, 3)) / (num_selected.squeeze() * reconstruction.shape[2] * reconstruction.shape[3])
+    loss_per_sample = masked_squared_error.sum(dim=(1, 2, 3)) / (
+        num_selected.squeeze() * reconstruction.shape[2] * reconstruction.shape[3]
+    )
     loss = loss_per_sample.mean()
 
     return loss
 
 
 # ==========================================
-# Chunked Dataset (Memory-Efficient)
+# Chunked Dataset (now also carries Grad-CAM maps)
 # ==========================================
 
 class ChunkedActivationDataset(Dataset):
     """Memory-efficient dataset that works with chunked activation data.
 
-    Avoids concatenating all chunks into a single tensor to prevent memory explosion.
-    Instead, keeps data in chunks and dynamically retrieves samples.
+    Now also returns the per-sample Grad-CAM spatial map alongside activations,
+    masks, and labels.
     """
 
-    def __init__(self, activation_chunks: List[torch.Tensor],
+    def __init__(self,
+                 activation_chunks: List[torch.Tensor],
                  mask_chunks: List[torch.Tensor],
-                 label_chunks: List[torch.Tensor]):
-        """
-        Args:
-            activation_chunks: List of activation tensors [chunk_size, C, H, W]
-            mask_chunks: List of mask tensors [chunk_size, C]
-            label_chunks: List of label tensors [chunk_size]
-        """
+                 label_chunks: List[torch.Tensor],
+                 gradcam_chunks: List[torch.Tensor]):
         self.activation_chunks = activation_chunks
         self.mask_chunks = mask_chunks
         self.label_chunks = label_chunks
+        self.gradcam_chunks = gradcam_chunks
 
-        # Build index mapping: (chunk_idx, sample_idx_in_chunk)
         self.index_map = []
         self.class_to_indices = defaultdict(list)
 
@@ -846,22 +899,18 @@ class ChunkedActivationDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        """Get activation, mask, and label by global index."""
         chunk_idx, sample_idx = self.index_map[idx]
 
         activation = self.activation_chunks[chunk_idx][sample_idx]
         mask = self.mask_chunks[chunk_idx][sample_idx]
         label = self.label_chunks[chunk_idx][sample_idx]
+        gradcam_map = self.gradcam_chunks[chunk_idx][sample_idx]
 
-        return activation, mask, label
+        return activation, mask, label, gradcam_map
 
 
 class ClassBalancedBatchSampler(Sampler):
-    """Samples batches ensuring all classes are represented in each batch.
-
-    This ensures that each mini-batch contains samples from diverse classes,
-    which helps with learning discriminative features.
-    """
+    """Samples batches ensuring all classes are represented in each batch."""
 
     def __init__(self, class_to_indices: Dict[int, List[int]],
                  batch_size: int,
@@ -871,7 +920,6 @@ class ClassBalancedBatchSampler(Sampler):
         self.drop_last = drop_last
         self.num_classes = len(class_to_indices)
 
-        # Calculate samples per class per batch
         self.samples_per_class = max(1, batch_size // self.num_classes)
         self.actual_batch_size = self.samples_per_class * self.num_classes
 
@@ -881,13 +929,11 @@ class ClassBalancedBatchSampler(Sampler):
         print(f"  Number of classes: {self.num_classes}")
 
     def __iter__(self):
-        # Shuffle indices within each class
         class_indices = {
             cls: np.random.permutation(indices).tolist()
             for cls, indices in self.class_to_indices.items()
         }
 
-        # Determine number of batches
         min_samples = min(len(indices) for indices in class_indices.values())
         num_batches = min_samples // self.samples_per_class
 
@@ -898,7 +944,6 @@ class ClassBalancedBatchSampler(Sampler):
                 end = start + self.samples_per_class
                 batch.extend(class_indices[cls][start:end])
 
-            # Shuffle within batch
             np.random.shuffle(batch)
             yield batch
 
@@ -908,13 +953,13 @@ class ClassBalancedBatchSampler(Sampler):
 
 
 # ==========================================
-# Visualization Functions
+# Visualization
 # ==========================================
 
 def plot_training_logs(logs: Dict[str, List], model_name: str, save_path: str):
     """Plot training metrics."""
     fig, axs = plt.subplots(3, 3, figsize=(18, 12))
-    fig.suptitle(f'Multi-Channel ConvSAE Training ({model_name.upper()} - ImageNet-1k)',
+    fig.suptitle(f'Multi-Channel ConvSAE Training ({model_name.upper()} - ImageNet-1k) - with Grad-CAM Sum Constraint',
                  fontsize=14, fontweight='bold')
 
     axs[0, 0].plot(logs["recon_loss"], color='blue', linewidth=1.5)
@@ -926,8 +971,8 @@ def plot_training_logs(logs: Dict[str, List], model_name: str, save_path: str):
     axs[0, 1].set_title("L1 Sparsity Loss")
     axs[0, 1].grid(True, alpha=0.3)
 
-    axs[0, 2].plot(logs["channel_sparsity_loss"], color='purple', linewidth=1.5)
-    axs[0, 2].set_title("Channel Sparsity Loss")
+    axs[0, 2].plot(logs["gradcam_loss"], color='magenta', linewidth=1.5)
+    axs[0, 2].set_title("Grad-CAM Sum Loss (sum_d z_d vs L_GradCAM)")
     axs[0, 2].grid(True, alpha=0.3)
 
     axs[1, 0].plot(logs["lateral_loss"], color='orange', linewidth=1.5)
@@ -949,14 +994,14 @@ def plot_training_logs(logs: Dict[str, List], model_name: str, save_path: str):
 
     axs[2, 1].plot(logs["recon_loss"], label='Recon', alpha=0.7)
     axs[2, 1].plot(logs["l1_loss"], label='L1', alpha=0.7)
+    axs[2, 1].plot(logs["gradcam_loss"], label='GradCAM', alpha=0.7)
     axs[2, 1].set_title("Loss Components (Log)")
     axs[2, 1].set_yscale('log')
     axs[2, 1].legend(fontsize=7)
     axs[2, 1].grid(True, alpha=0.3)
 
-    axs[2, 2].scatter(logs["channel_sparsity_loss"], logs["recon_loss"],
-                     c=range(len(logs["recon_loss"])), cmap='viridis', alpha=0.5, s=5)
-    axs[2, 2].set_title("Recon vs Channel Sparsity")
+    axs[2, 2].plot(logs["channel_sparsity_loss"], color='purple', linewidth=1.5)
+    axs[2, 2].set_title("Channel Sparsity Loss")
     axs[2, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -966,48 +1011,48 @@ def plot_training_logs(logs: Dict[str, List], model_name: str, save_path: str):
 
 
 # ==========================================
-# Main Training Script
+# Main
 # ==========================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Multi-Model ConvSAE Training on Full ImageNet-1k'
+        description='Multi-Model ConvSAE Training on Full ImageNet-1k (with Grad-CAM sum constraint)'
     )
     parser.add_argument('--model', type=str, default='resnet50',
-                       choices=list(MODEL_CONFIGS.keys()),
-                       help='Backbone model (default: resnet50)')
-    parser.add_argument('--target_layer', type=str, default=None,
-                       help='Target layer name (default: model-specific default)')
-    parser.add_argument('--force_resample', action='store_true',
-                       help='Force resampling of dataset')
+                       choices=list(MODEL_CONFIGS.keys()))
+    parser.add_argument('--target_layer', type=str, default=None)
+    parser.add_argument('--force_resample', action='store_true')
     parser.add_argument('--force_reextract', action='store_true',
-                       help='Force re-extraction of activations (ignore cache)')
-    parser.add_argument('--epochs', type=int, default=15,
-                       help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=None,
-                       help='Training batch size (auto-adjusted if not specified)')
-    parser.add_argument('--accumulation_steps', type=int, default=1,
-                       help='Gradient accumulation steps (default: 1, no accumulation)')
+                       help='Force re-extraction of activations (needed when upgrading from a cache without Grad-CAM maps)')
+    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--accumulation_steps', type=int, default=1)
+
+    # NEW: hyperparameter for the Grad-CAM decomposition constraint
+    parser.add_argument('--lambda_gradcam', type=float, default=1.0,
+                       help='Weight for the Grad-CAM sum constraint loss '
+                            '(sum_d z_d ~ L_GradCAM). Default: 1.0')
+    parser.add_argument('--gradcam_no_normalize', action='store_true',
+                       help='If set, do NOT L1-normalize z_sum and gradcam_map '
+                            'before comparing (raw MSE). Default: normalize.')
 
     args = parser.parse_args()
 
-    # Auto-adjust batch size based on model if not specified
     if args.batch_size is None:
         if args.model == 'resnet50':
-            args.batch_size = 16  # Large model, small batches
+            args.batch_size = 16
         elif args.model == 'vgg16':
-            args.batch_size = 16  # Large model
+            args.batch_size = 16
         else:
-            args.batch_size = 32  # ResNet18, EfficientNet
+            args.batch_size = 32
 
     print("="*80)
     print(f"Multi-Channel ConvSAE Training on Full ImageNet-1k")
     print(f"Backbone: {args.model.upper()}")
+    print(f"Grad-CAM Decomposition Constraint: ENABLED  (lambda_gradcam={args.lambda_gradcam})")
     print("="*80)
 
-    # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
 
@@ -1031,20 +1076,22 @@ def main():
         force_resample=args.force_resample
     )
 
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE_COLLECTION, shuffle=False, num_workers=4)
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE_COLLECTION,
+                             shuffle=False, num_workers=4)
 
-    # Extract activations
+    # Extract activations + Grad-CAM maps
     extractor = MultiModelActivationExtractor(
         model_name=args.model,
         target_layer=args.target_layer,
         device=device
     )
 
-    activation_chunks, mask_chunks, label_chunks = extractor.collect_activation_maps_chunked(
+    (activation_chunks, mask_chunks,
+     label_chunks, gradcam_chunks) = extractor.collect_activation_maps_chunked(
         data_loader,
         normalize=True,
         chunk_size=ACTIVATION_CHUNK_SIZE,
-        use_cache=not args.force_reextract  # Cache enabled unless --force_reextract is set
+        use_cache=not args.force_reextract
     )
 
     # Setup training
@@ -1053,13 +1100,12 @@ def main():
     KERNEL_SIZE = 1
     TOP_K = int(HIDDEN_DIM * 0.4)
 
-    #LAMBDA_L1 = 0.3
     LAMBDA_L1 = 0.3
     LAMBDA_LAT = 0.01
     LAMBDA_COMPACT = 0.01
     LAMBDA_CHANNEL_SPARSITY = 0.0
+    LAMBDA_GRADCAM = args.lambda_gradcam   # NEW
 
-    # Calculate effective batch size
     effective_batch_size = args.batch_size * args.accumulation_steps
 
     print(f"\nTraining Configuration:")
@@ -1071,11 +1117,12 @@ def main():
     print(f"  Epochs: {args.epochs}")
     print(f"  Learning Rate: {args.lr}")
     print(f"  Batch Size: {args.batch_size} (GPU)")
+    print(f"  Lambda GradCAM: {LAMBDA_GRADCAM}")
+    print(f"  GradCAM normalization: {'OFF (raw MSE)' if args.gradcam_no_normalize else 'ON (per-sample L1 norm)'}")
     if args.accumulation_steps > 1:
         print(f"  Accumulation Steps: {args.accumulation_steps}")
         print(f"  Effective Batch Size: {effective_batch_size}")
 
-    # Memory info
     if torch.cuda.is_available():
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"  GPU Memory: {gpu_mem:.1f} GB")
@@ -1091,16 +1138,17 @@ def main():
     lat_inhib_loss = LateralInhibitionLoss().to(device)
     compact_loss_fn = SpatialCompactnessLoss().to(device)
     channel_sparsity_loss_fn = FeatureChannelSparsityLoss().to(device)
+    gradcam_decomp_loss_fn = GradCAMDecompositionLoss(
+        normalize=not args.gradcam_no_normalize
+    ).to(device)
 
-    # Create memory-efficient chunked dataset
     train_dataset = ChunkedActivationDataset(
         activation_chunks=activation_chunks,
         mask_chunks=mask_chunks,
-        label_chunks=label_chunks
+        label_chunks=label_chunks,
+        gradcam_chunks=gradcam_chunks,
     )
 
-    # Use class-balanced sampling only for small datasets (< 100 classes)
-    # For ImageNet-1k (1000 classes), use regular random sampling
     num_classes = len(train_dataset.class_to_indices)
 
     if num_classes <= 100:
@@ -1124,10 +1172,10 @@ def main():
     logs = {
         "total_loss": [], "recon_loss": [], "l1_loss": [],
         "lateral_loss": [], "compact_loss": [], "channel_sparsity_loss": [],
+        "gradcam_loss": [],          # NEW
         "active_pct": []
     }
 
-    # Training loop
     print(f"\n{'='*80}")
     print("Starting Training...")
     print(f"{'='*80}")
@@ -1135,12 +1183,13 @@ def main():
     for epoch in range(args.epochs):
         epoch_metrics = {k: 0 for k in logs.keys()}
         n_batches = 0
-        optimizer.zero_grad()  # Zero gradients at start of epoch
+        optimizer.zero_grad()
 
-        for batch_idx, (batch_acts, batch_masks, batch_labels) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            batch_acts, batch_masks, batch_labels, batch_gradcam = batch
             batch_acts = batch_acts.to(device)
             batch_masks = batch_masks.to(device)
-            # batch_labels available but not used in unsupervised training
+            batch_gradcam = batch_gradcam.to(device)   # [B, H, W]
 
             # Forward pass
             reconstruction, sparse_features = csae_model(batch_acts, use_topk=True)
@@ -1151,32 +1200,31 @@ def main():
             loss_lateral = lat_inhib_loss(sparse_features)
             loss_compact = compact_loss_fn(sparse_features)
             loss_channel_sparsity = channel_sparsity_loss_fn(csae_model.encoder.weight)
+            # NEW: enforce sum_d z_d ~ Grad-CAM map
+            loss_gradcam = gradcam_decomp_loss_fn(sparse_features, batch_gradcam)
 
             loss = (loss_recon +
                    LAMBDA_L1 * loss_l1 +
                    LAMBDA_LAT * loss_lateral +
                    LAMBDA_COMPACT * loss_compact +
-                   LAMBDA_CHANNEL_SPARSITY * loss_channel_sparsity)
+                   LAMBDA_CHANNEL_SPARSITY * loss_channel_sparsity +
+                   LAMBDA_GRADCAM * loss_gradcam)
 
-            # Scale loss for gradient accumulation
             loss = loss / args.accumulation_steps
             loss.backward()
 
-            # Update weights every accumulation_steps
             if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(csae_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 csae_model.normalize_decoder_weights()
 
-                # Clear GPU cache periodically
                 if torch.cuda.is_available() and (batch_idx + 1) % (args.accumulation_steps * 10) == 0:
                     torch.cuda.empty_cache()
 
-            # Logging (scale loss back for display)
             with torch.no_grad():
                 active_pct = (sparse_features > 0).float().mean().item() * 100
-                displayed_loss = loss.item() * args.accumulation_steps  # Scale back for display
+                displayed_loss = loss.item() * args.accumulation_steps
 
                 logs["total_loss"].append(displayed_loss)
                 logs["recon_loss"].append(loss_recon.item())
@@ -1184,6 +1232,7 @@ def main():
                 logs["lateral_loss"].append(loss_lateral.item())
                 logs["compact_loss"].append(loss_compact.item())
                 logs["channel_sparsity_loss"].append(loss_channel_sparsity.item())
+                logs["gradcam_loss"].append(loss_gradcam.item())
                 logs["active_pct"].append(active_pct)
 
                 for k in epoch_metrics.keys():
@@ -1194,17 +1243,19 @@ def main():
                 displayed_loss = loss.item() * args.accumulation_steps
                 print(f"\rEpoch {epoch+1}/{args.epochs} [{batch_idx}/{len(train_loader)}] "
                       f"Loss: {displayed_loss:.4f} | Recon: {loss_recon.item():.4f} | "
+                      f"GradCAM: {loss_gradcam.item():.5f} | "
                       f"Active: {active_pct:.1f}%", end="")
 
         avg_metrics = {k: v / n_batches for k, v in epoch_metrics.items()}
         print(f"\n[Epoch {epoch+1}/{args.epochs}] Summary:")
-        print(f"  Total Loss: {avg_metrics['total_loss']:.4f}")
+        print(f"  Total Loss:     {avg_metrics['total_loss']:.4f}")
         print(f"  Reconstruction: {avg_metrics['recon_loss']:.4f}")
+        print(f"  GradCAM Sum:    {avg_metrics['gradcam_loss']:.6f}")
         print(f"  Active Channels: {avg_metrics['active_pct']:.2f}%")
         print("-" * 80)
 
     # Save
-    output_prefix = f"imagenet1k_csae_{args.model}"
+    output_prefix = f"imagenet1k_csae_{args.model}_gcsum"
     if args.target_layer:
         layer_suffix = args.target_layer.replace('[', '_').replace(']', '')
         output_prefix += f"_{layer_suffix}"
@@ -1221,6 +1272,8 @@ def main():
             'top_k': TOP_K,
             'epochs': args.epochs,
             'lr': args.lr,
+            'lambda_gradcam': LAMBDA_GRADCAM,
+            'gradcam_normalize': not args.gradcam_no_normalize,
         },
         'logs': logs,
         'final_metrics': avg_metrics
@@ -1230,7 +1283,7 @@ def main():
     plot_training_logs(logs, args.model, f'{output_prefix}_logs.png')
 
     print(f"\n{'='*80}")
-    print("✓ Training Complete!")
+    print("Training Complete!")
     print(f"  Model: {output_prefix}_model.pkl")
     print(f"  Logs: {output_prefix}_logs.png")
     print(f"{'='*80}")
