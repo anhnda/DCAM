@@ -1045,6 +1045,7 @@ def main():
     parser.add_argument('--gradcam_no_normalize', action='store_true',
                        help='If set, do NOT L1-normalize z_sum and gradcam_map '
                             'before comparing (raw MSE). Default: normalize.')
+    parser.add_argument('--cumulative_threshold', type=float, default=0.85)
 
     args = parser.parse_args()
 
@@ -1092,7 +1093,8 @@ def main():
     extractor = MultiModelActivationExtractor(
         model_name=args.model,
         target_layer=args.target_layer,
-        device=device
+        device=device, 
+        cumulative_threshold=args.cumulative_threshold,
     )
 
     (activation_chunks, mask_chunks,
@@ -1140,7 +1142,7 @@ def main():
         in_channels=INPUT_CHANNELS,
         hidden_dim=HIDDEN_DIM,
         kernel_size=KERNEL_SIZE,
-        top_k=TOP_K
+        top_k=TOP_K,
     ).to(device)
 
     optimizer = optim.Adam(csae_model.parameters(), lr=args.lr, weight_decay=1e-5)
