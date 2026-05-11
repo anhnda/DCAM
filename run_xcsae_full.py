@@ -1045,7 +1045,7 @@ def main():
     parser.add_argument('--gradcam_no_normalize', action='store_true',
                        help='If set, do NOT L1-normalize z_sum and gradcam_map '
                             'before comparing (raw MSE). Default: normalize.')
-    parser.add_argument('--cumulative_threshold', type=float, default=0.85)
+    parser.add_argument('--cumulative_threshold', type=float, default=0.95)
 
     args = parser.parse_args()
 
