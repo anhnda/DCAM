@@ -393,7 +393,53 @@ class MultiModelSAEVisualizerTestMF:
 
         return channel_mask, num_selected, weights, pred_class, gradcam_map.cpu()
 
-    def extract_features(self, image: Image.Image, label: int, top_k: int = 16) -> Dict:
+    def get_top_input_channels_for_feature(self, feature_id: int,
+                                           top_n: int = 6,
+                                           view: str = 'encoder'
+                                           ) -> Tuple[List[int], List[float]]:
+        """For a given SAE latent feature index, return the input-channel indices
+        that contribute most to it, along with their (signed) weight values.
+
+        Args:
+            feature_id: index d into the SAE hidden dimension (0..D-1).
+            top_n: how many input channels to return.
+            view: 'encoder' (default) uses row d of W_e -- "which input channels
+                  cause z_d to fire". 'decoder' uses column d of W_d -- "which
+                  input channels z_d reconstructs into". For most interpretability
+                  questions, 'encoder' is the right choice.
+
+        Returns:
+            (channel_ids, weights) -- two parallel lists of length top_n.
+            channel_ids: input channel indices (0..C-1).
+            weights: the (signed) connection weights, sorted by magnitude
+                     (largest |weight| first).
+        """
+        with torch.no_grad():
+            if view == 'encoder':
+                # encoder.weight: [D, C, kH, kW]; for 1x1 kernel, kH=kW=1
+                w = self.csae_model.encoder.weight[feature_id]      # [C, kH, kW]
+            elif view == 'decoder':
+                # decoder.weight: [C, D, kH, kW]; column d
+                w = self.csae_model.decoder.weight[:, feature_id]   # [C, kH, kW]
+            else:
+                raise ValueError(f"view must be 'encoder' or 'decoder', got {view}")
+
+            # Average over the (typically 1x1) kernel so we get one scalar per channel
+            w_per_channel = w.view(w.shape[0], -1).mean(dim=1)      # [C]
+
+            # Rank by |weight|, then read off the signed value
+            mag = w_per_channel.abs()
+            top_n = min(top_n, mag.numel())
+            top_vals, top_idx = torch.topk(mag, k=top_n)
+            channel_ids = top_idx.cpu().tolist()
+            weights = w_per_channel[top_idx].cpu().tolist()
+
+        return channel_ids, weights
+
+    def extract_features(self, image: Image.Image, label: int, top_k: int = 16,
+                         feature_id: int = None,
+                         top_input_channels: int = 6,
+                         input_channel_view: str = 'encoder') -> Dict:
         """
         Extract top-k activated features for a test image, plus the Grad-CAM
         spatial map.
@@ -434,17 +480,63 @@ class MultiModelSAEVisualizerTestMF:
             'correct': (label == pred_label),
             'num_selected_channels': num_selected,
             'channel_weights': channel_weights.cpu(),
-            'gradcam_map': gradcam_map,                # NEW: H x W grad-cam heatmap
+            'gradcam_map': gradcam_map,                # H x W grad-cam heatmap
             'top_features': top_features,
             'feature_importance': feature_importance.cpu()
         }
 
+        # ------------------------------------------------------------------
+        # If a specific feature_id is requested, also collect:
+        #   - that feature's own activation map for this image
+        #   - the top input channels that feed into it (encoder view)
+        #   - the actual normalized activation maps of those input channels
+        #     on THIS image (so the user sees the per-image evidence)
+        # ------------------------------------------------------------------
+        if feature_id is not None:
+            if feature_id < 0 or feature_id >= self.csae_model.hidden_dim:
+                raise ValueError(
+                    f"feature_id={feature_id} out of range "
+                    f"[0, {self.csae_model.hidden_dim})"
+                )
+
+            # The feature's own activation map for this image
+            feature_act_map = sparse_features[0, feature_id, :, :].cpu()
+            feature_self_importance = feature_act_map.sum().item()
+
+            # Top input channels by encoder-weight magnitude
+            top_ch_ids, top_ch_weights = self.get_top_input_channels_for_feature(
+                feature_id=feature_id,
+                top_n=top_input_channels,
+                view=input_channel_view
+            )
+
+            # Their actual activation maps on THIS image (normalized version,
+            # since that's what the SAE sees)
+            input_channel_maps = []
+            for ch_id, w_val in zip(top_ch_ids, top_ch_weights):
+                ch_map = layer_acts_norm[0, ch_id, :, :].cpu()
+                input_channel_maps.append((ch_id, w_val, ch_map))
+
+            results['feature_id'] = feature_id
+            results['feature_act_map'] = feature_act_map
+            results['feature_self_importance'] = feature_self_importance
+            results['input_channel_maps'] = input_channel_maps  # list of (ch_id, weight, map)
+            results['input_channel_view'] = input_channel_view
+
         return results
 
     def visualize_features(self, image: Image.Image, label: int,
-                          top_k: int = 16, save_path: str = None):
+                          top_k: int = 16, save_path: str = None,
+                          feature_id: int = None,
+                          top_input_channels: int = 6,
+                          input_channel_view: str = 'encoder'):
         print(f"Processing test image (label={label})...")
-        results = self.extract_features(image, label, top_k=top_k)
+        results = self.extract_features(
+            image, label, top_k=top_k,
+            feature_id=feature_id,
+            top_input_channels=top_input_channels,
+            input_channel_view=input_channel_view,
+        )
 
         print("Generating visualization...")
         self._plot_feature_grid(results, save_path)
@@ -461,7 +553,10 @@ class MultiModelSAEVisualizerTestMF:
     # ----------------------------------------------------------------------
 
     def _plot_feature_grid(self, results: Dict, save_path: str = None):
-        """Plot grid of CSAE features with Grad-CAM heatmap in overview row."""
+        """Plot grid of CSAE features with Grad-CAM heatmap in overview row.
+        If results contains 'feature_id', an extra bottom row shows the input
+        activation channels that contribute most to that feature.
+        """
         image = results['image']
         gradcam_map = results['gradcam_map']
         top_features = results['top_features']
@@ -472,28 +567,26 @@ class MultiModelSAEVisualizerTestMF:
 
         n_features = len(top_features)
         n_cols = 8
-        n_rows = 1 + (n_features + 3) // 4
+        n_feature_rows = (n_features + 3) // 4
+        has_feature_input = 'feature_id' in results
+        # 1 overview row + feature rows + (optionally) 1 input-channel sub-row
+        n_rows = 1 + n_feature_rows + (1 if has_feature_input else 0)
 
         fig = plt.figure(figsize=(24, 3.5 * n_rows))
-        gs = fig.add_gridspec(n_rows, n_cols, hspace=0.4, wspace=0.3)
+        gs = fig.add_gridspec(n_rows, n_cols, hspace=0.5, wspace=0.3)
 
         # ===== Row 0: Input image | Grad-CAM | Info | Importance =====
-        # Input image (cols 0-1)
         ax_img = fig.add_subplot(gs[0, 0:2])
         ax_img.imshow(image)
         ax_img.set_title("Test Image", fontsize=12, fontweight='bold')
         ax_img.axis('off')
 
-        # NEW: Grad-CAM heatmap (cols 2-3)
         ax_gc = fig.add_subplot(gs[0, 2:4])
-        # Resize/upsample Grad-CAM to image resolution for nicer display, OR
-        # show it at native H x W with bilinear interpolation.
         ax_gc.imshow(gradcam_map.numpy(), cmap='jet', interpolation='bilinear')
         ax_gc.set_title("Grad-CAM Heatmap\n(target for sum of features)",
                         fontsize=11, fontweight='bold')
         ax_gc.axis('off')
 
-        # Prediction info (cols 4-5)
         ax_info = fig.add_subplot(gs[0, 4:6])
         ax_info.axis('off')
 
@@ -506,6 +599,9 @@ class MultiModelSAEVisualizerTestMF:
         info_text += f"  - {self.csae_model.hidden_dim} CSAE features\n"
         info_text += f"  - Top-k: {self.csae_model.top_k}\n"
         info_text += f"  - GradCAM: {num_selected}/{self.num_channels} channels"
+        if has_feature_input:
+            info_text += f"\n  - Queried feature: F{results['feature_id']}"
+            info_text += f"\n  - Input view: {results['input_channel_view']}"
 
         ax_info.text(0.05, 0.5, info_text, fontsize=9, family='monospace',
                     verticalalignment='center', transform=ax_info.transAxes,
@@ -513,33 +609,53 @@ class MultiModelSAEVisualizerTestMF:
                              facecolor='lightgreen' if correct else 'lightcoral',
                              alpha=0.3))
 
-        # Feature importance bar chart (cols 6-7)
         ax_bar = fig.add_subplot(gs[0, 6:])
         importances = [imp for _, imp, _ in top_features]
         feature_indices = [f"F{idx}" for idx, _, _ in top_features]
+        bar_colors = ['crimson' if has_feature_input and idx == results['feature_id']
+                      else 'steelblue'
+                      for idx, _, _ in top_features]
         ax_bar.bar(range(len(importances)), importances,
-                  color='steelblue', alpha=0.8, edgecolor='navy')
+                  color=bar_colors, alpha=0.85, edgecolor='navy')
         ax_bar.set_xlabel('Feature', fontsize=9)
         ax_bar.set_ylabel('Importance', fontsize=9)
-        ax_bar.set_title(f'Top-{n_features} Importance',
-                        fontsize=11, fontweight='bold')
+        ax_bar.set_title(f'Top-{n_features} Importance', fontsize=11, fontweight='bold')
         ax_bar.set_xticks(range(len(importances)))
         ax_bar.set_xticklabels(feature_indices, rotation=45, ha='right', fontsize=7)
         ax_bar.grid(True, alpha=0.3, axis='y')
 
-        # ===== Rows 1+: Feature maps =====
+        # ===== Rows 1..n_feature_rows: Feature maps =====
         for i, (feat_idx, importance, activation_map) in enumerate(top_features):
             row = 1 + i // 4
             col = (i % 4) * 2
 
             ax_feat = fig.add_subplot(gs[row, col:col+2])
             im = ax_feat.imshow(activation_map.numpy(), cmap='hot', interpolation='bilinear')
-            ax_feat.set_title(f"Feature {feat_idx}\nImp: {importance:.2f}",
-                             fontsize=10, fontweight='bold')
+            highlight = (has_feature_input and feat_idx == results['feature_id'])
+            title_prefix = "[Q] " if highlight else ""
+            title_color = 'crimson' if highlight else 'black'
+            ax_feat.set_title(f"{title_prefix}Feature {feat_idx}\nImp: {importance:.2f}",
+                             fontsize=10, fontweight='bold', color=title_color)
             ax_feat.axis('off')
+            if highlight:
+                for spine in ax_feat.spines.values():
+                    spine.set_edgecolor('crimson')
+                    spine.set_linewidth(3)
+                    spine.set_visible(True)
+                ax_feat.set_xticks([])
+                ax_feat.set_yticks([])
+                ax_feat.set_frame_on(True)
 
             cbar = plt.colorbar(im, ax=ax_feat, fraction=0.046, pad=0.04)
             cbar.ax.tick_params(labelsize=7)
+
+        # ===== Final row (if feature_id given): input channels feeding F_d =====
+        if has_feature_input:
+            self._render_feature_input_subrow_full(
+                fig, gs, results,
+                row_index=n_rows - 1,
+                n_cols=n_cols,
+            )
 
         status_str = "CORRECT" if correct else "WRONG"
         plt.suptitle(f'ImageNet-1k Test Visualization ({status_str})  --  ' +
@@ -554,11 +670,82 @@ class MultiModelSAEVisualizerTestMF:
             plt.show()
 
     # ----------------------------------------------------------------------
+    # Helper: draw the "input channels contributing to feature F_d" sub-row
+    # ----------------------------------------------------------------------
+
+    def _render_feature_input_subrow_full(self, fig, gs, results: Dict,
+                                           row_index: int, n_cols: int):
+        """Draw a row showing:
+            [F_d itself]  [ch_a, w=W]  [ch_b, w=W]  ...
+        for the queried feature in `results['feature_id']`.
+
+        Uses the same gridspec `gs` row at `row_index`, spanning n_cols columns.
+        """
+        feature_id = results['feature_id']
+        feature_act_map = results['feature_act_map']
+        feature_self_imp = results['feature_self_importance']
+        input_channel_maps = results['input_channel_maps']  # [(ch_id, w, map)]
+        view_name = results.get('input_channel_view', 'encoder')
+
+        n_inputs = len(input_channel_maps)
+        # Layout within the row: feature occupies cols 0:2, inputs share cols 2..n_cols
+        # Each input panel takes 1 column.
+        ax_feat = fig.add_subplot(gs[row_index, 0:2])
+        im = ax_feat.imshow(feature_act_map.numpy(), cmap='hot', interpolation='bilinear')
+        ax_feat.set_title(f"[Q] Feature F{feature_id}\n(self-importance: {feature_self_imp:.2f})",
+                         fontsize=10, fontweight='bold', color='crimson')
+        for spine in ax_feat.spines.values():
+            spine.set_edgecolor('crimson')
+            spine.set_linewidth(3)
+            spine.set_visible(True)
+        ax_feat.set_xticks([])
+        ax_feat.set_yticks([])
+        ax_feat.set_frame_on(True)
+        cbar = plt.colorbar(im, ax=ax_feat, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=7)
+
+        # Available columns for input channel panels: 2 .. n_cols
+        avail_cols = n_cols - 2
+        if n_inputs == 0 or avail_cols <= 0:
+            return
+        # Allocate roughly one column per input; if more inputs than cols, cap.
+        n_shown = min(n_inputs, avail_cols)
+
+        for k in range(n_shown):
+            ch_id, w_val, ch_map = input_channel_maps[k]
+            col_start = 2 + k * (avail_cols // n_shown)
+            col_end = 2 + (k + 1) * (avail_cols // n_shown)
+            # Last panel absorbs remaining columns
+            if k == n_shown - 1:
+                col_end = n_cols
+
+            ax_ch = fig.add_subplot(gs[row_index, col_start:col_end])
+            im_ch = ax_ch.imshow(ch_map.numpy(), cmap='viridis', interpolation='bilinear')
+            sign = "+" if w_val >= 0 else "-"
+            # Color the title by sign of contribution
+            t_color = 'darkgreen' if w_val >= 0 else 'darkred'
+            ax_ch.set_title(f"ch {ch_id}  ({view_name} w={sign}{abs(w_val):.3f})",
+                            fontsize=9, fontweight='bold', color=t_color)
+            ax_ch.set_xticks([])
+            ax_ch.set_yticks([])
+            # Border by sign
+            for spine in ax_ch.spines.values():
+                spine.set_edgecolor(t_color)
+                spine.set_linewidth(1.5)
+                spine.set_visible(True)
+            ax_ch.set_frame_on(True)
+            cbar = plt.colorbar(im_ch, ax=ax_ch, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=6)
+
+    # ----------------------------------------------------------------------
     # CONSISTENCY MODE
     # ----------------------------------------------------------------------
 
     def visualize_class_consistency(self, images: List[Image.Image], label: int,
-                                   top_k: int = 12, save_path: str = None):
+                                   top_k: int = 12, save_path: str = None,
+                                   feature_id: int = None,
+                                   top_input_channels: int = 6,
+                                   input_channel_view: str = 'encoder'):
         n_images = len(images)
         print(f"\nAnalyzing {n_images} images from class {label}...")
 
@@ -566,7 +753,12 @@ class MultiModelSAEVisualizerTestMF:
 
         all_results = []
         for i, image in enumerate(images):
-            results = self.extract_features(image, label, top_k=top_k)
+            results = self.extract_features(
+                image, label, top_k=top_k,
+                feature_id=feature_id,
+                top_input_channels=top_input_channels,
+                input_channel_view=input_channel_view,
+            )
             all_results.append(results)
             print(f"  Image {i+1}: {len(results['top_features'])} top features, "
                   f"prediction={'OK' if results['correct'] else 'WRONG'}")
@@ -575,7 +767,9 @@ class MultiModelSAEVisualizerTestMF:
         print(f"  Common features across all images: {len(common_features)}")
 
         print("Generating class consistency visualization...")
-        self._plot_class_consistency(all_results, label, class_name, common_features, save_path)
+        self._plot_class_consistency(all_results, label, class_name,
+                                      common_features, save_path,
+                                      feature_id=feature_id)
 
         print(f"Class consistency visualization complete!")
         if save_path:
@@ -598,32 +792,38 @@ class MultiModelSAEVisualizerTestMF:
 
     def _plot_class_consistency(self, all_results: List[Dict], label: int,
                                 class_name: str, common_features: List[int],
-                                save_path: str = None):
+                                save_path: str = None,
+                                feature_id: int = None):
         """
         Layout:
         - Row 0 (overview): class info | input images | common-features bar chart
-        - Rows 1..n_images (one per image):
-            [Grad-CAM heatmap]  [Feature 1]  [Feature 2]  ...  [Feature k]
-            i.e. Grad-CAM occupies column 0; features fill columns 1..k.
+        - Per image:
+            Feature row:     [Grad-CAM]  [F1]  [F2]  ...  [Fk]
+            Input sub-row    (only if feature_id given):
+                             [Feature F_d (recap)]  [ch_a, w]  [ch_b, w]  ...
         """
         n_images = len(all_results)
         n_features_per_image = min(12, len(all_results[0]['top_features']))
+        has_feature_id = feature_id is not None
 
-        # Total columns: 1 (grad-cam) + n_features_per_image features.
-        # Overview row uses the same grid; we lay it out as:
-        #   cols 0..1: info
-        #   cols 2..(2+2*n_images-1): input images (2 cols each)
-        #   remaining cols: common-features bar chart
-        # We keep the overview at 16-col width to match the previous version.
+        # Each image takes 1 row normally, or 2 rows (feature row + input row)
+        # when feature_id is set.
+        rows_per_image = 2 if has_feature_id else 1
+
+        # Total columns:
+        # Without feature_id: 1 (grad-cam) + n_features_per_image, min 16
+        # With feature_id: same total columns; the input row reuses the same
+        # column structure (feature recap in cols 0..1, input channels spread
+        # across cols 2..total_cols).
         total_cols = max(1 + n_features_per_image, 16)
 
-        # Figure width: more cols => wider
         col_width = 1.7
         fig_width = max(28, total_cols * col_width)
-        fig_height = 4 + 3.5 * n_images
+        fig_height = 4 + 3.5 * rows_per_image * n_images
 
+        total_rows = 1 + rows_per_image * n_images
         fig = plt.figure(figsize=(fig_width, fig_height))
-        gs = fig.add_gridspec(n_images + 1, total_cols, hspace=0.5, wspace=0.4)
+        gs = fig.add_gridspec(total_rows, total_cols, hspace=0.6, wspace=0.4)
 
         # ===== Row 0: Overview =====
         ax_info = fig.add_subplot(gs[0, 0:2])
@@ -634,7 +834,13 @@ class MultiModelSAEVisualizerTestMF:
         info_text += f"Analyzing:\n"
         info_text += f"  - {n_images} test images\n"
         info_text += f"  - Top-{n_features_per_image} features each\n"
-        info_text += f"  - {len(common_features)} common features\n\n"
+        info_text += f"  - {len(common_features)} common features\n"
+        if has_feature_id:
+            view_name = all_results[0].get('input_channel_view', 'encoder')
+            info_text += f"  - Queried feature: F{feature_id}\n"
+            info_text += f"  - Input view: {view_name}\n\n"
+        else:
+            info_text += "\n"
         info_text += f"Backbone: {self.model_name}\n"
 
         correct_count = sum(1 for r in all_results if r['correct'])
@@ -642,13 +848,11 @@ class MultiModelSAEVisualizerTestMF:
 
         ax_info.text(0.1, 0.5, info_text, fontsize=10, family='monospace',
                     verticalalignment='center', transform=ax_info.transAxes,
-                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+                    bbox=dict(boxstyle='round',
+                             facecolor='lavender' if has_feature_id else 'lightblue',
+                             alpha=0.3))
 
         # Input images in overview row
-        # Place them in cols 2 .. 2 + 2*n_images
-        max_overview_image_end = min(2 + 2 * n_images, total_cols - 4)
-        # Make sure we leave room for the common-features bar chart
-        image_span_end = min(2 + 2 * n_images, total_cols)
         for i, results in enumerate(all_results):
             col_start = 2 + i * 2
             col_end = col_start + 2
@@ -660,7 +864,7 @@ class MultiModelSAEVisualizerTestMF:
             ax_img.set_title(f"Image {i+1} [{status}]", fontsize=11, fontweight='bold')
             ax_img.axis('off')
 
-        # Common-features bar chart fills the rest of overview row
+        # Common-features bar chart
         bar_col_start = max(2 + 2 * n_images, total_cols // 2)
         if bar_col_start < total_cols:
             ax_common = fig.add_subplot(gs[0, bar_col_start:])
@@ -673,8 +877,10 @@ class MultiModelSAEVisualizerTestMF:
                     ])
                     common_importances.append(avg_imp)
 
+                bar_colors = ['crimson' if has_feature_id and f == feature_id else 'green'
+                              for f in common_features[:15]]
                 ax_common.barh(range(len(common_features[:15])), common_importances,
-                              color='green', alpha=0.7, edgecolor='darkgreen')
+                              color=bar_colors, alpha=0.8, edgecolor='darkgreen')
                 ax_common.set_yticks(range(len(common_features[:15])))
                 ax_common.set_yticklabels([f'F{f}' for f in common_features[:15]], fontsize=8)
                 ax_common.set_xlabel('Avg Importance', fontsize=10)
@@ -688,17 +894,16 @@ class MultiModelSAEVisualizerTestMF:
                               transform=ax_common.transAxes)
                 ax_common.axis('off')
 
-        # ===== Rows 1..n_images: per-image rows =====
-        # Each row: [Grad-CAM @ col 0] [F1 @ col 1] [F2 @ col 2] ... [Fk @ col k]
+        # ===== Per-image blocks =====
         for img_idx, results in enumerate(all_results):
-            row = img_idx + 1
+            # Feature row for this image
+            feat_row = 1 + img_idx * rows_per_image
             top_features = results['top_features'][:n_features_per_image]
             gradcam_map = results['gradcam_map']
 
-            # --- Column 0: Grad-CAM heatmap for THIS image ---
-            ax_gc = fig.add_subplot(gs[row, 0])
+            # Column 0: Grad-CAM heatmap
+            ax_gc = fig.add_subplot(gs[feat_row, 0])
             ax_gc.imshow(gradcam_map.numpy(), cmap='jet', interpolation='bilinear')
-            # Highlight with a colored border so users see this is the "target"
             for spine in ax_gc.spines.values():
                 spine.set_edgecolor('royalblue')
                 spine.set_linewidth(2.5)
@@ -709,38 +914,68 @@ class MultiModelSAEVisualizerTestMF:
             ax_gc.set_xticks([])
             ax_gc.set_yticks([])
 
-            # --- Columns 1..k: top feature maps ---
+            # Columns 1..k: top feature maps
             for feat_pos, (f_idx, importance, activation_map) in enumerate(top_features):
                 col = 1 + feat_pos
                 if col >= total_cols:
                     break
 
-                ax_feat = fig.add_subplot(gs[row, col])
-
+                ax_feat = fig.add_subplot(gs[feat_row, col])
                 is_common = f_idx in common_features
+                is_queried = has_feature_id and f_idx == feature_id
 
                 im = ax_feat.imshow(activation_map.numpy(), cmap='hot', interpolation='bilinear')
-                title_color = 'green' if is_common else 'black'
-                ax_feat.set_title(f"F{f_idx}\n{importance:.1f}",
-                                fontsize=9, fontweight='bold' if is_common else 'normal',
+                if is_queried:
+                    title_color = 'crimson'
+                    title_prefix = "[Q] "
+                elif is_common:
+                    title_color = 'green'
+                    title_prefix = ""
+                else:
+                    title_color = 'black'
+                    title_prefix = ""
+                ax_feat.set_title(f"{title_prefix}F{f_idx}\n{importance:.1f}",
+                                fontsize=9,
+                                fontweight='bold' if (is_common or is_queried) else 'normal',
                                 color=title_color)
                 ax_feat.axis('off')
 
-                if is_common:
+                if is_queried:
+                    for spine in ax_feat.spines.values():
+                        spine.set_edgecolor('crimson')
+                        spine.set_linewidth(3)
+                        spine.set_visible(True)
+                    ax_feat.set_xticks([])
+                    ax_feat.set_yticks([])
+                    ax_feat.set_frame_on(True)
+                elif is_common:
                     for spine in ax_feat.spines.values():
                         spine.set_edgecolor('green')
                         spine.set_linewidth(3)
                         spine.set_visible(True)
-                    # axis('off') hides spines; turn them back on by re-enabling ticks off but spine on
                     ax_feat.set_xticks([])
                     ax_feat.set_yticks([])
                     ax_feat.set_frame_on(True)
 
+            # Input sub-row (only if feature_id was provided AND results has it)
+            if has_feature_id and 'input_channel_maps' in results:
+                input_row = feat_row + 1
+                self._render_feature_input_subrow_full(
+                    fig, gs, results,
+                    row_index=input_row,
+                    n_cols=total_cols,
+                )
+
         # Title
-        plt.suptitle(f'Feature Consistency ({self.model_name}): Class {label} ({class_name[:40]}...)\n' +
-                    f'Each row: [Grad-CAM | top-{n_features_per_image} features] -- '
-                    f'{len(common_features)} common features highlighted in green',
-                    fontsize=14, fontweight='bold', y=0.998)
+        title = (f'Feature Consistency ({self.model_name}): '
+                 f'Class {label} ({class_name[:40]}...)\n'
+                 f'Each row: [Grad-CAM | top-{n_features_per_image} features]')
+        if has_feature_id:
+            title += (f' -- queried F{feature_id} in crimson, '
+                      f'plus per-image input-channel sub-row beneath')
+        else:
+            title += f' -- {len(common_features)} common features in green'
+        plt.suptitle(title, fontsize=14, fontweight='bold', y=0.998)
 
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -774,6 +1009,20 @@ def main():
                        default='imagenet1k_test_visualizations')
     parser.add_argument('--force_resample', action='store_true')
 
+    # ----- New: feature-input inspection -----
+    parser.add_argument('--feature_id', type=int, default=None,
+                       help='If set, add a sub-row beneath each image showing the '
+                            'input activation channels that contribute most to '
+                            'SAE feature z_d (with channel ids and weights).')
+    parser.add_argument('--top_input_channels', type=int, default=6,
+                       help='How many top input channels to display per feature '
+                            '(default: 6).')
+    parser.add_argument('--input_channel_view', type=str, default='encoder',
+                       choices=['encoder', 'decoder'],
+                       help='Which weight matrix to inspect: '
+                            "'encoder' = inputs that drive z_d (default), "
+                            "'decoder' = inputs that z_d reconstructs into.")
+
     args = parser.parse_args()
 
     if args.target_layer is None:
@@ -788,6 +1037,10 @@ def main():
     print(f"Target layer: {args.target_layer}")
     print(f"CSAE model: {args.csae_model}")
     print(f"Each feature row starts with that image's Grad-CAM heatmap.")
+    if args.feature_id is not None:
+        print(f"Queried feature: F{args.feature_id}  "
+              f"(top {args.top_input_channels} input channels via "
+              f"{args.input_channel_view} weights)")
     print("="*80)
 
     output_dir = Path(args.output_dir)
@@ -840,7 +1093,10 @@ def main():
             visualizer.visualize_class_consistency(
                 images, class_idx,
                 top_k=args.top_k_features,
-                save_path=str(save_path)
+                save_path=str(save_path),
+                feature_id=args.feature_id,
+                top_input_channels=args.top_input_channels,
+                input_channel_view=args.input_channel_view,
             )
 
             for img in images:
@@ -887,7 +1143,10 @@ def main():
             visualizer.visualize_features(
                 image, label,
                 top_k=args.top_k_features,
-                save_path=str(save_path)
+                save_path=str(save_path),
+                feature_id=args.feature_id,
+                top_input_channels=args.top_input_channels,
+                input_channel_view=args.input_channel_view,
             )
 
         accuracy = (correct_count / len(test_samples)) * 100
