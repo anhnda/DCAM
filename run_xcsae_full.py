@@ -1046,6 +1046,7 @@ def main():
                        help='If set, do NOT L1-normalize z_sum and gradcam_map '
                             'before comparing (raw MSE). Default: normalize.')
     parser.add_argument('--cumulative_threshold', type=float, default=0.95)
+    parser.add_argument('--top_k', type=int, default=32)
 
     args = parser.parse_args()
 
@@ -1109,7 +1110,7 @@ def main():
     INPUT_CHANNELS = extractor.num_channels
     HIDDEN_DIM = INPUT_CHANNELS * 8
     KERNEL_SIZE = 1
-    TOP_K = 32 # int(HIDDEN_DIM * 0.05)
+    TOP_K = args.top_k # int(HIDDEN_DIM * 0.05)
 
     LAMBDA_L1 = 0.3
     LAMBDA_LAT = 0.01
