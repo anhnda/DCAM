@@ -93,8 +93,14 @@ MODEL_CONFIGS = {
 
 def load_image_for_class(test_metadata_path: Path,
                          class_id: int,
-                         seed: int = None) -> Image.Image:
-    """Pick a single test image from the cached sampled test set."""
+                         seed: int = None) -> Tuple[Image.Image, int, int]:
+    """Pick a single test image from the cached sampled test set.
+
+    Returns:
+        (image, num_available, chosen_local_idx)
+        num_available  : how many cached test images exist for this class
+        chosen_local_idx : which of those was picked (0..num_available-1)
+    """
     if not test_metadata_path.exists():
         raise FileNotFoundError(
             f"Test metadata not found at {test_metadata_path}. "
@@ -104,15 +110,22 @@ def load_image_for_class(test_metadata_path: Path,
     metadata = joblib.load(test_metadata_path)
     samples = metadata['samples']
 
-    # Filter by class
+    # Filter by class (preserve order so chosen_local_idx is reproducible)
     class_samples = [(b, lbl) for (b, lbl) in samples if lbl == class_id]
-    if len(class_samples) == 0:
+    n = len(class_samples)
+    if n == 0:
         raise ValueError(f"No cached test samples for class_id={class_id}")
 
-    rng = random.Random(seed) if seed is not None else random
-    image_bytes, label = rng.choice(class_samples)
+    # ALWAYS use an explicit, isolated RNG seeded by `seed`. The caller is
+    # responsible for picking a fresh seed (e.g. from os.urandom) when the
+    # user did not specify one, so that re-runs vary AND remain reproducible
+    # via the printed seed.
+    rng = random.Random(seed)
+    idx = rng.randrange(n)
+    image_bytes, label = class_samples[idx]
     assert label == class_id
-    return Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    return img, n, idx
 
 
 # ==========================================
@@ -606,6 +619,18 @@ def main():
     if args.csae_model is None:
         args.csae_model = f'imagenet1k_csae_{args.model}_model.pkl'
 
+    # ----------------------------------------------------------------------
+    # Concretize the random seed.  If the user did not pass --random_seed,
+    # generate a fresh one from system entropy here and log it.  This is the
+    # ONLY source of randomness used to pick an image, so the chosen image
+    # is fully reproducible from the printed seed, while different invocations
+    # without an explicit seed are guaranteed to differ.
+    # ----------------------------------------------------------------------
+    user_supplied_seed = args.random_seed is not None
+    if not user_supplied_seed:
+        import os, struct
+        args.random_seed = struct.unpack('<I', os.urandom(4))[0]
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -619,12 +644,16 @@ def main():
     print(f"  top_k feat:  {args.top_k_features}   "
           f"top_in_ch:   {args.top_input_channels}   "
           f"view: {args.input_channel_view}")
-    print(f"  Seed:        {args.random_seed}")
+    print(f"  Seed:        {args.random_seed}"
+          f"{'  (auto-generated; reuse with --random_seed)' if not user_supplied_seed else ''}")
     print("=" * 80)
 
-    # 1) Load test image
+    # 1) Load test image (deterministic given seed; varies across runs without one)
     test_meta = Path(args.test_data_dir) / "test_metadata.pkl"
-    image = load_image_for_class(test_meta, args.class_id, seed=args.random_seed)
+    image, n_avail, chosen_idx = load_image_for_class(
+        test_meta, args.class_id, seed=args.random_seed
+    )
+    print(f"  Picked image {chosen_idx + 1} / {n_avail} for class {args.class_id}")
 
     # 2) Build extractor and run
     extractor = HierExtractor(
@@ -641,9 +670,14 @@ def main():
         input_channel_view=args.input_channel_view,
     )
 
-    # 3) Save figure
-    seed_tag = f"seed{args.random_seed}" if args.random_seed is not None else "seedrand"
-    save_path = output_dir / f"hier_class{args.class_id}_{seed_tag}_{args.model}.png"
+    # 3) Save figure -- filename always includes the concrete seed AND the
+    # local index, so two different runs with different auto-seeds that
+    # happened to pick the same image still produce distinct filenames.
+    save_path = (output_dir /
+                 f"hier_class{args.class_id}"
+                 f"_img{chosen_idx}"
+                 f"_seed{args.random_seed}"
+                 f"_{args.model}.png")
     build_radial_figure(
         results,
         model_name=args.model,
