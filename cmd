@@ -11,6 +11,10 @@ python run_protopnet_full.py --model resnet50 --batch_size 8
 #    Train Multi-Channel ConvSAE on full ImageNet-1k (1000 classes, 50 imgs/class)
 ################################################################################
 
+python run_xcsae_full.py
+python visualize_testmf_full.py     --model resnet50     --csae_model imagenet1k_csae_resnet50_gcsum_model.pkl     --num_classes 10     --images_per_class_viz 5     --top_k_features 12     --output_dir viz_gcsum_consistency
+python check_acc_drop_full.py --model resnet50 --csae_model imagenet1k_csae_resnet50_gcsum_model.pkl
+
 # ResNet50 (default) - 1024 channels at layer3
 python run_xcsae_full.py
 
