@@ -696,18 +696,32 @@ class MultiModelSAEVisualizerTestMF:
         ax_bar.set_xticklabels(feature_indices, rotation=45, ha='right', fontsize=7)
         ax_bar.grid(True, alpha=0.3, axis='y')
 
-        # ===== Rows 1..n_feature_rows: Feature maps =====
+        # ===== Rows 1..n_feature_rows: Feature maps with SHARED COLORSCALE =====
+        # Compute global vmax across the top-k features so visual brightness
+        # reflects actual contribution magnitude, not per-panel auto-scale.
+        if len(top_features) > 0:
+            shared_vmax_rand = max(float(m.max()) for _, _, m in top_features)
+            if shared_vmax_rand < 1e-8:
+                shared_vmax_rand = 1.0
+        else:
+            shared_vmax_rand = 1.0
+
         for i, (feat_idx, importance, activation_map) in enumerate(top_features):
             row = 1 + i // 4
             col = (i % 4) * 2
 
             ax_feat = fig.add_subplot(gs[row, col:col+2])
-            im = ax_feat.imshow(activation_map.numpy(), cmap='hot', interpolation='bilinear')
+            im = ax_feat.imshow(activation_map.numpy(), cmap='hot',
+                                interpolation='bilinear',
+                                vmin=0.0, vmax=shared_vmax_rand)
             highlight = (has_feature_input and feat_idx == results['feature_id'])
             title_prefix = "[Q] " if highlight else ""
             title_color = 'crimson' if highlight else 'black'
-            ax_feat.set_title(f"{title_prefix}Feature {feat_idx}\nImp: {importance:.2f}",
-                             fontsize=10, fontweight='bold', color=title_color)
+            local_peak = float(activation_map.max())
+            ax_feat.set_title(
+                f"{title_prefix}F{feat_idx}\nImp {importance:.2f}  Peak {local_peak:.2f}",
+                fontsize=10, fontweight='bold', color=title_color,
+            )
             ax_feat.axis('off')
             if highlight:
                 for spine in ax_feat.spines.values():
@@ -1009,7 +1023,18 @@ class MultiModelSAEVisualizerTestMF:
             ax_sum.set_xticks([])
             ax_sum.set_yticks([])
 
-            # Columns 2..k+1: top feature maps
+            # Columns 2..k+1: top feature maps with SHARED COLORSCALE
+            # Per-panel auto-scaling makes diffuse small features look as bright
+            # as concentrated large ones. We use a shared vmin=0 / vmax = max
+            # over the top-k features for THIS image, so visual brightness
+            # reflects actual contribution magnitude.
+            if len(top_features) > 0:
+                shared_vmax = max(float(m.max()) for _, _, m in top_features)
+                if shared_vmax < 1e-8:
+                    shared_vmax = 1.0  # avoid degenerate empty colormap
+            else:
+                shared_vmax = 1.0
+
             for feat_pos, (f_idx, importance, activation_map) in enumerate(top_features):
                 col = 2 + feat_pos
                 if col >= total_cols:
@@ -1019,7 +1044,12 @@ class MultiModelSAEVisualizerTestMF:
                 is_common = f_idx in common_features
                 is_queried = has_feature_id and f_idx == feature_id
 
-                im = ax_feat.imshow(activation_map.numpy(), cmap='hot', interpolation='bilinear')
+                im = ax_feat.imshow(activation_map.numpy(), cmap='hot',
+                                    interpolation='bilinear',
+                                    vmin=0.0, vmax=shared_vmax)
+                # Show this feature's own peak value, so faint-but-still-shown
+                # features are explicitly labeled as faint.
+                local_peak = float(activation_map.max())
                 if is_queried:
                     title_color = 'crimson'
                     title_prefix = "[Q] "
@@ -1029,10 +1059,12 @@ class MultiModelSAEVisualizerTestMF:
                 else:
                     title_color = 'black'
                     title_prefix = ""
-                ax_feat.set_title(f"{title_prefix}F{f_idx}\n{importance:.1f}",
-                                fontsize=9,
-                                fontweight='bold' if (is_common or is_queried) else 'normal',
-                                color=title_color)
+                ax_feat.set_title(
+                    f"{title_prefix}F{f_idx}\nimp {importance:.1f}  pk {local_peak:.2f}",
+                    fontsize=8,
+                    fontweight='bold' if (is_common or is_queried) else 'normal',
+                    color=title_color,
+                )
                 ax_feat.axis('off')
 
                 if is_queried:
