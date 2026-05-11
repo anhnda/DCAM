@@ -27,18 +27,20 @@ For a chosen class_id, samples ONE test image and produces a single figure with:
             red   = negative encoder weight (channel suppresses z_d)
 
 Usage:
-    python hier_visualize.py --class_id 207                  # golden retriever, random img
-    python hier_visualize.py --class_id 207 --random_seed 42
+    python hier_visualize.py --class_id 207                  # offset 0 (first cached image)
+    python hier_visualize.py --class_id 207 --offset 3       # 4th cached image
     python hier_visualize.py --class_id 207 --top_k_features 12 --top_input_channels 4
     python hier_visualize.py --class_id 207 --model resnet18
 
+    # Sweep all cached images for a class:
+    for i in 0 1 2 3 4; do python hier_visualize.py --class_id 207 --offset $i; done
+
 Output:
-    hier_class{class_id}_seed{seed}_{model}.png    in --output_dir
+    hier_class{class_id}_img{idx}_{model}.png    in --output_dir
 """
 
 import argparse
 import io
-import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -93,13 +95,26 @@ MODEL_CONFIGS = {
 
 def load_image_for_class(test_metadata_path: Path,
                          class_id: int,
-                         seed: int = None) -> Tuple[Image.Image, int, int]:
-    """Pick a single test image from the cached sampled test set.
+                         offset: int = 0) -> Tuple[Image.Image, int, int]:
+    """Pick a single test image from the cached sampled test set by offset.
+
+    The cached test samples are stored in a fixed, deterministic order in
+    metadata['samples']. We filter to the rows whose label == class_id (also
+    a deterministic, order-preserving operation) and then directly index by
+    `offset`. Negative offsets wrap from the end (Python list convention),
+    and offsets >= n wrap modulo n.
+
+    Args:
+        test_metadata_path: path to test_metadata.pkl produced by the test
+            sampler in visualize_testmf_full.py.
+        class_id: ImageNet-1k class id in [0, 999].
+        offset: which of the cached images for this class to pick. Wrapped
+            into [0, n) where n is the number of cached images for the class.
 
     Returns:
         (image, num_available, chosen_local_idx)
-        num_available  : how many cached test images exist for this class
-        chosen_local_idx : which of those was picked (0..num_available-1)
+            num_available    : how many cached test images exist for this class
+            chosen_local_idx : the wrapped offset actually used (0..num_available-1)
     """
     if not test_metadata_path.exists():
         raise FileNotFoundError(
@@ -110,18 +125,18 @@ def load_image_for_class(test_metadata_path: Path,
     metadata = joblib.load(test_metadata_path)
     samples = metadata['samples']
 
-    # Filter by class (preserve order so chosen_local_idx is reproducible)
+    # Filter by class. Order-preserving, so identical (class_id, offset)
+    # always returns the same image.
     class_samples = [(b, lbl) for (b, lbl) in samples if lbl == class_id]
     n = len(class_samples)
     if n == 0:
         raise ValueError(f"No cached test samples for class_id={class_id}")
 
-    # ALWAYS use an explicit, isolated RNG seeded by `seed`. The caller is
-    # responsible for picking a fresh seed (e.g. from os.urandom) when the
-    # user did not specify one, so that re-runs vary AND remain reproducible
-    # via the printed seed.
-    rng = random.Random(seed)
-    idx = rng.randrange(n)
+    idx = offset % n
+    if offset != idx:
+        print(f"  Note: offset {offset} wrapped to {idx} (only {n} cached "
+              f"images for class {class_id})")
+
     image_bytes, label = class_samples[idx]
     assert label == class_id
     img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
@@ -415,7 +430,9 @@ def build_radial_figure(results: Dict,
                         model_name: str,
                         target_layer: str,
                         save_path: str,
-                        random_seed: int = None):
+                        offset: int = 0,
+                        img_idx: int = 0,
+                        n_available: int = None):
     image = results['image']
     gradcam_map = results['gradcam_map']
     z_sum_map = results['z_sum_map']
@@ -561,8 +578,8 @@ def build_radial_figure(results: Dict,
     status = "CORRECT" if correct else "WRONG"
     header = (f"Hierarchical DCAM view  --  {model_name} @ {target_layer}  --  "
               f"true: {true_class[:40]}  |  pred: {pred_class[:40]}  [{status}]")
-    if random_seed is not None:
-        header += f"  (seed={random_seed})"
+    if n_available is not None:
+        header += f"  (img {img_idx + 1}/{n_available}, offset={offset})"
     fig.text(0.5, 0.97, header, ha='center', va='top',
              fontsize=13, fontweight='bold')
 
@@ -593,8 +610,10 @@ def main():
     )
     parser.add_argument('--class_id', type=int, required=True,
                         help='ImageNet-1k class id (0..999)')
-    parser.add_argument('--random_seed', type=int, default=None,
-                        help='Optional seed for sampling the test image')
+    parser.add_argument('--offset', type=int, default=0,
+                        help='Which of the cached test images for this class '
+                             'to pick. Wrapped modulo the number of cached '
+                             'images for the class. Default: 0.')
     parser.add_argument('--model', type=str, default='resnet50',
                         choices=list(MODEL_CONFIGS.keys()))
     parser.add_argument('--target_layer', type=str, default=None)
@@ -619,18 +638,6 @@ def main():
     if args.csae_model is None:
         args.csae_model = f'imagenet1k_csae_{args.model}_model.pkl'
 
-    # ----------------------------------------------------------------------
-    # Concretize the random seed.  If the user did not pass --random_seed,
-    # generate a fresh one from system entropy here and log it.  This is the
-    # ONLY source of randomness used to pick an image, so the chosen image
-    # is fully reproducible from the printed seed, while different invocations
-    # without an explicit seed are guaranteed to differ.
-    # ----------------------------------------------------------------------
-    user_supplied_seed = args.random_seed is not None
-    if not user_supplied_seed:
-        import os, struct
-        args.random_seed = struct.unpack('<I', os.urandom(4))[0]
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -644,16 +651,16 @@ def main():
     print(f"  top_k feat:  {args.top_k_features}   "
           f"top_in_ch:   {args.top_input_channels}   "
           f"view: {args.input_channel_view}")
-    print(f"  Seed:        {args.random_seed}"
-          f"{'  (auto-generated; reuse with --random_seed)' if not user_supplied_seed else ''}")
+    print(f"  Offset:      {args.offset}")
     print("=" * 80)
 
-    # 1) Load test image (deterministic given seed; varies across runs without one)
+    # 1) Load test image (deterministic given offset)
     test_meta = Path(args.test_data_dir) / "test_metadata.pkl"
     image, n_avail, chosen_idx = load_image_for_class(
-        test_meta, args.class_id, seed=args.random_seed
+        test_meta, args.class_id, offset=args.offset
     )
-    print(f"  Picked image {chosen_idx + 1} / {n_avail} for class {args.class_id}")
+    print(f"  Picked image {chosen_idx + 1} / {n_avail} "
+          f"for class {args.class_id} (offset {args.offset} -> idx {chosen_idx})")
 
     # 2) Build extractor and run
     extractor = HierExtractor(
@@ -670,20 +677,20 @@ def main():
         input_channel_view=args.input_channel_view,
     )
 
-    # 3) Save figure -- filename always includes the concrete seed AND the
-    # local index, so two different runs with different auto-seeds that
-    # happened to pick the same image still produce distinct filenames.
+    # 3) Save figure -- filename uses the resolved index, so iterating
+    # --offset 0..N-1 produces N distinct files with no collisions.
     save_path = (output_dir /
                  f"hier_class{args.class_id}"
                  f"_img{chosen_idx}"
-                 f"_seed{args.random_seed}"
                  f"_{args.model}.png")
     build_radial_figure(
         results,
         model_name=args.model,
         target_layer=args.target_layer,
         save_path=str(save_path),
-        random_seed=args.random_seed,
+        offset=args.offset,
+        img_idx=chosen_idx,
+        n_available=n_avail,
     )
 
     print("=" * 80)
