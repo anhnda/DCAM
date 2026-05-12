@@ -1047,6 +1047,7 @@ def main():
                             'before comparing (raw MSE). Default: normalize.')
     parser.add_argument('--cumulative_threshold', type=float, default=0.95)
     parser.add_argument('--top_k', type=int, default=32)
+    parser.add_argument('--model_suffix', type=str, default='', help='Optional suffix for model naming and logging')
 
     args = parser.parse_args()
 
@@ -1272,8 +1273,8 @@ def main():
         layer_suffix = args.target_layer.replace('[', '_').replace(']', '')
         output_prefix += f"_{layer_suffix}"
 
-    torch.save(csae_model.state_dict(), f'{output_prefix}_model.pth')
-    joblib.dump(csae_model.cpu(), f'{output_prefix}_model.pkl')
+    torch.save(csae_model.state_dict(), f'{output_prefix}{args.model_suffix}_model.pth')
+    joblib.dump(csae_model.cpu(), f'{output_prefix}{args.model_suffix }_model.pkl')
 
     training_info = {
         'config': {
