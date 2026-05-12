@@ -352,7 +352,8 @@ def run_evaluation(args):
     sds_header = "|SΔS\\|/K"
 
     print(f"{'eps':>8} {'Jaccard':>9} {'flip':>8} "
-        f"{sds_header:>12} {'<eps*':>8} {'rho(γ,J)':>11} {'rho(e*,J)':>11}")  print('-' * 90)
+        f"{sds_header:>12} {'<eps*':>8} {'rho(γ,J)':>11} {'rho(e*,J)':>11}")
+    print('-' * 90)
 
     for eps in args.epsilons:
         rs = results[str(eps)]
