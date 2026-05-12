@@ -298,7 +298,9 @@ def run_evaluation(args):
           f"tau={args.tau}, epsilons={args.epsilons}")
     print("=" * 70)
 
-    results = {eps: [] for eps in args.epsilons}
+    # Use string keys throughout so per_image and per_epsilon agree,
+    # and so the in-memory representation matches the JSON dump.
+    results = {str(eps): [] for eps in args.epsilons}
 
     for img_idx, (image, label) in enumerate(tqdm(eval_loader, desc="Images")):
         image = image.to(device)
@@ -353,7 +355,7 @@ def run_evaluation(args):
                     float(np.mean(theo_bound_trials)) /
                     max(float(np.mean(measured_trials)), 1e-12)
                 )
-            results[eps].append(entry)
+            results[str(eps)].append(entry)
 
     # ---------- Aggregate ----------
     summary = {
@@ -372,7 +374,7 @@ def run_evaluation(args):
     }
 
     # Image-level diagnostics
-    rs0 = results[args.epsilons[0]]
+    rs0 = results[str(args.epsilons[0])]
     margins_all = [r['margin'] for r in rs0]
     minba_all = [r['min_bar_alpha'] for r in rs0]
     eps_star_all = [r['eps_star'] for r in rs0 if np.isfinite(r['eps_star'])]
@@ -415,7 +417,7 @@ def run_evaluation(args):
     print('-' * 110)
 
     for eps in args.epsilons:
-        rs = results[eps]
+        rs = results[str(eps)]
         j_mean = np.mean([r['jaccard_mean'] for r in rs])
         flip = np.mean([r['flip_rate'] for r in rs])
         ratio_mean = np.mean([r['sym_diff_ratio_mean'] for r in rs])
