@@ -52,7 +52,10 @@ from torchvision import transforms
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
-
+import torch
+torch.use_deterministic_algorithms(True, warn_only=True)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 sys.path.append('.')
 from src.gradcam import GradCAM
 from run_xcsae_full import (
