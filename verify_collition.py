@@ -81,60 +81,125 @@ def find_cache_dir(cache_root: Path, model: str, target_layer: str,
     return matches[0]
 
 
-def load_cache(cache_dir: Path, max_parts: int = None):
-    """Load activation / gradcam / label chunks from the incremental cache.
+def stream_usage_matrices(cache_dir: Path, max_parts: int = None,
+                          split_seed: int = 0):
+    """Stream the chunked cache and accumulate the channel x class usage
+    matrix U WITHOUT ever holding more than one chunk in memory.
+
+    At your scale (50k x 1024 x 14 x 14 fp32 ~= 40 GB), materializing the full
+    activation tensor is impossible on a 64 GB box. But every quantity the
+    three checks need is a *reduction* over samples:
+
+        per-sample usage:  u_n[c] = sum_{i,j} L_GC_n[i,j] * A_{n,c}[i,j]   [C]
+
+    and U[c,y] is just the per-class MEAN of u_n. So we keep running per-class
+    SUMS (class_sum[C, n_class]) and COUNTS, updated one ~80 MB chunk at a time.
+
+    We simultaneously maintain two disjoint-half accumulators (routing each
+    sample by a hash of its global index) so Check 2 needs no second pass and
+    no extra memory.
 
     Returns
     -------
-    acts   : float32 [N, C, H, W]   (already 99th-pct normalized at extraction)
-    gcmaps : float32 [N, H, W]      (L1-normalized per image, sums to 1)
-    labels : int64   [N]
+    U        : [C, n_class]  full usage matrix (per-class mean)
+    U_a, U_b : [C, n_class]  usage matrices on two disjoint sample halves
+    classes  : [n_class]     sorted unique labels actually seen
+    per_sample_usage : [N, C] float32  (small: 50k x 1024 x 4 = 205 MB)
+                       kept because it's cheap and lets Check 2 resample
+                       splits without re-reading the cache.
+    sample_labels    : [N]   int64, aligned with per_sample_usage rows
     """
     meta = joblib.load(cache_dir / "metadata.pkl")
     n_parts = meta['num_chunks']
     if max_parts is not None:
         n_parts = min(n_parts, max_parts)
+    C = meta['num_channels']
 
-    acts, gcs, lbls = [], [], []
-    for p in range(n_parts):
+    # First pass over labels is unnecessary; we discover classes on the fly and
+    # remap to a dense [0, n_class) index. ImageNet has <=1000 classes so a
+    # fixed-size buffer is fine and avoids a remap pass.
+    max_classes = 1000
+    class_sum = np.zeros((C, max_classes), dtype=np.float64)
+    class_cnt = np.zeros(max_classes, dtype=np.int64)
+    class_sum_a = np.zeros((C, max_classes), dtype=np.float64)
+    class_cnt_a = np.zeros(max_classes, dtype=np.int64)
+    class_sum_b = np.zeros((C, max_classes), dtype=np.float64)
+    class_cnt_b = np.zeros(max_classes, dtype=np.int64)
+
+    per_sample_chunks = []   # small: [c, C] per chunk
+    label_chunks = []
+    seen = set()
+
+    global_idx = 0
+    from tqdm import tqdm as _tqdm
+    for p in _tqdm(range(n_parts), desc="Streaming cache"):
         part = joblib.load(cache_dir / f"part_{p:04d}.pkl")
-        acts.append(part['activation'].float())          # [c, C, H, W]
-        gcs.append(part['gradcam_map'].float())          # [c, H, W]
-        lbls.append(part['label'].long())                # [c]
-    acts = torch.cat(acts, 0)
-    gcs = torch.cat(gcs, 0)
-    lbls = torch.cat(lbls, 0)
-    print(f"  loaded {acts.shape[0]} samples, "
-          f"C={acts.shape[1]}, H=W={acts.shape[2]}, "
-          f"classes={lbls.unique().numel()}")
-    return acts.numpy(), gcs.numpy(), lbls.numpy()
+        a = part['activation'].numpy()              # [c, C, H, W] fp32
+        g = part['gradcam_map'].numpy()             # [c, H, W]
+        lbl = part['label'].numpy().astype(np.int64)  # [c]
+        c_, C_, H_, W_ = a.shape
+
+        np.clip(a, 0.0, None, out=a)                # defensive, in place
+        # per-sample channel usage u_n[c] = sum_ij g_n * a_{n,c}
+        # einsum keeps it in one BLAS call, no [N,C,H,W] intermediate copy
+        u = np.einsum('nij,ncij->nc', g, a, optimize=True).astype(np.float32)  # [c, C]
+
+        # accumulate full + split halves
+        for i in range(c_):
+            y = int(lbl[i]); seen.add(y)
+            class_sum[:, y] += u[i]; class_cnt[y] += 1
+            # deterministic split by hash of global index (independent of order)
+            if (hash((split_seed, global_idx)) & 1) == 0:
+                class_sum_a[:, y] += u[i]; class_cnt_a[y] += 1
+            else:
+                class_sum_b[:, y] += u[i]; class_cnt_b[y] += 1
+            global_idx += 1
+
+        per_sample_chunks.append(u)
+        label_chunks.append(lbl)
+        del a, g, part            # free the big chunk immediately
+
+    classes = np.array(sorted(seen))
+    def _to_U(csum, ccnt):
+        U = np.zeros((C, classes.size), dtype=np.float64)
+        for j, y in enumerate(classes):
+            if ccnt[y] > 0:
+                U[:, j] = csum[:, y] / ccnt[y]
+        return np.clip(U, 0.0, None)
+
+    U = _to_U(class_sum, class_cnt)
+    U_a = _to_U(class_sum_a, class_cnt_a)
+    U_b = _to_U(class_sum_b, class_cnt_b)
+
+    per_sample_usage = np.concatenate(per_sample_chunks, axis=0)   # [N, C] fp32
+    sample_labels = np.concatenate(label_chunks, axis=0)           # [N]
+
+    print(f"  streamed {per_sample_usage.shape[0]} samples, "
+          f"C={C}, classes={classes.size}, "
+          f"per-sample-usage held in RAM = "
+          f"{per_sample_usage.nbytes/1e9:.2f} GB")
+    return U, U_a, U_b, classes, per_sample_usage, sample_labels
 
 
-# ----------------------------------------------------------------------
-# Build the channel x class attention-weighted usage matrix U
-# ----------------------------------------------------------------------
+def usage_matrix_from_per_sample(per_sample_usage, sample_labels, idx=None):
+    """Build U[C, n_class] from the small precomputed per-sample usage table.
 
-def build_usage_matrix(acts, gcmaps, labels):
-    """U[c, y] = mean over class-y images of  sum_{i,j} L_GC[i,j] * A_c[i,j].
-
-    This is the seed-independent sufficient statistic the coalitions live in:
-    "how much does channel c contribute, attention-weighted, for class y".
-    Non-negative by construction (acts are ReLU/clamped >=0, gcmaps >=0),
-    which is what makes NMF the right factorization.
-
-    Returns U : [C, n_classes]  (non-negative)
+    Used by Check 2 to resample splits cheaply (no cache re-read). `idx`
+    restricts to a subset of samples (e.g. one data half).
     """
-    N, C, H, W = acts.shape
-    # per-sample channel usage: u_c = sum_{ij} gc_ij * A_c_ij   -> [N, C]
-    # (acts already non-negative; clamp defensively)
-    a = np.clip(acts, 0.0, None)
-    g = gcmaps.reshape(N, 1, H, W)                 # [N,1,H,W]
-    per_sample = (a * g).sum(axis=(2, 3))          # [N, C]
-
-    classes = np.unique(labels)
+    if idx is not None:
+        ps = per_sample_usage[idx]
+        lab = sample_labels[idx]
+    else:
+        ps = per_sample_usage
+        lab = sample_labels
+    classes = np.unique(lab)
+    C = ps.shape[1]
     U = np.zeros((C, classes.size), dtype=np.float64)
     for j, y in enumerate(classes):
-        U[:, j] = per_sample[labels == y].mean(axis=0)
+        sel = ps[lab == y]
+        if sel.shape[0] > 0:
+            U[:, j] = sel.mean(axis=0)
     # guard tiny negatives from float error
     U = np.clip(U, 0.0, None)
     return U, classes
@@ -203,19 +268,23 @@ def hungarian_match_cosine(Wa, Wb):
     return np.sort(matched)[::-1]
 
 
-def check2_split_reproducibility(acts, gcmaps, labels, r_star, n_repeats=1):
+def check2_split_reproducibility(per_sample_usage, sample_labels, r_star,
+                                 n_repeats=3):
+    """Resample disjoint data halves from the small per-sample usage table
+    (no cache re-read), NMF each half, Hungarian-match coalitions."""
     print("\n[CHECK 2] NMF coalition reproducibility across data halves ...")
-    N = acts.shape[0]
+    N = per_sample_usage.shape[0]
     rng = np.random.default_rng(0)
     all_matched = []
     for rep in range(n_repeats):
         perm = rng.permutation(N)
         half = N // 2
         idx_a, idx_b = perm[:half], perm[half:]
-        Ua, _ = build_usage_matrix(acts[idx_a], gcmaps[idx_a], labels[idx_a])
-        Ub, _ = build_usage_matrix(acts[idx_b], gcmaps[idx_b], labels[idx_b])
-        # align class axes (both built over the full class set; if a half is
-        # missing a class its column is the zero vector, harmless for NMF rows)
+        Ua, _ = usage_matrix_from_per_sample(per_sample_usage, sample_labels, idx_a)
+        Ub, _ = usage_matrix_from_per_sample(per_sample_usage, sample_labels, idx_b)
+        # NMF factors are [C, r] regardless of how many class columns each half
+        # has, so matching on W (channel-space coalitions) is well-defined even
+        # if a half is missing some classes.
         _, Wa, _ = nmf_reconstruction_error(Ua, r_star)
         _, Wb, _ = nmf_reconstruction_error(Ub, r_star)
         matched = hungarian_match_cosine(Wa, Wb)
@@ -394,9 +463,11 @@ def main():
     cache_dir = find_cache_dir(Path(args.cache_root), args.model,
                                args.target_layer, args.cumulative_threshold)
     print(f"Cache: {cache_dir}")
-    acts, gcmaps, labels = load_cache(cache_dir, max_parts=args.max_parts)
-
-    U, classes = build_usage_matrix(acts, gcmaps, labels)
+    # Streaming pass: builds U (and split halves) one ~80 MB chunk at a time.
+    # Never materializes the full [N, C, H, W] activation tensor (~40 GB).
+    (U, U_a, U_b, classes,
+     per_sample_usage, sample_labels) = stream_usage_matrices(
+        cache_dir, max_parts=args.max_parts)
     print(f"Usage matrix U: {U.shape}  (channels x classes), "
           f"density={ (U>1e-8).mean():.3f}")
 
@@ -407,7 +478,8 @@ def main():
     res = {}
     res['check1'] = check1_rank_plateau(U, ranks)
     r_star = res['check1']['r_star']
-    res['check2'] = check2_split_reproducibility(acts, gcmaps, labels, r_star)
+    res['check2'] = check2_split_reproducibility(
+        per_sample_usage, sample_labels, r_star)
 
     if args.sae_seed_a and args.sae_seed_b:
         res['check3'] = check3_subspace_vs_atom(args.sae_seed_a,
