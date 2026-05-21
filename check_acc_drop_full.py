@@ -253,26 +253,46 @@ class MultiModelWithCSAEReconstruction:
         self.activations = output
 
     def _normalize_activations(self, acts: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Normalize activations using per-channel 99th percentile."""
+        """Normalize activations using per-channel 99th percentile (vectorized)."""
         B, C, H, W = acts.shape
-        normalized = acts.clone()
-        scale_factors = torch.ones(B, C, device=acts.device)
+        flat = acts.view(B, C, H * W)  # (B, C, HW)
 
-        for b in range(B):
-            for c in range(C):
-                channel_data = acts[b, c, :, :]
+        # Mask of "non-zero" positives, matching original semantics
+        pos_mask = flat > 1e-8  # (B, C, HW)
 
-                if channel_data.abs().sum() < 1e-8:
-                    continue
+        # Replace non-positives with -inf so they're ignored by quantile-via-sort.
+        # Using a large negative sentinel keeps dtype/device clean.
+        neg_inf = torch.finfo(flat.dtype).min
+        masked = torch.where(pos_mask, flat, torch.full_like(flat, neg_inf))
 
-                non_zero_vals = channel_data[channel_data > 1e-8]
-                if len(non_zero_vals) > 0:
-                    scale_factor = torch.quantile(non_zero_vals, 0.99)
+        # Sort ascending along HW; the -inf sentinels collect at the bottom.
+        sorted_vals, _ = torch.sort(masked, dim=-1)  # (B, C, HW)
 
-                    if scale_factor > 1e-8:
-                        channel_data = torch.clamp(channel_data, min=0.0, max=scale_factor)
-                        normalized[b, c, :, :] = channel_data / (scale_factor + 1e-8)
-                        scale_factors[b, c] = scale_factor
+        # For each (b, c), pick the 99th percentile *among the positives only*.
+        n_pos = pos_mask.sum(dim=-1)  # (B, C), long
+        # Index into the top `n_pos` valid entries; quantile index = ceil(0.99 * (n_pos - 1))
+        # torch.quantile uses linear interpolation; for a faithful match use that,
+        # but nearest-rank is fine here and avoids gather gymnastics.
+        # Position in sorted_vals: (HW - n_pos) is where positives start.
+        start = (H * W) - n_pos                              # (B, C)
+        q_offset = ((n_pos - 1).clamp(min=0).float() * 0.99).long()
+        q_idx = (start + q_offset).clamp(max=H * W - 1)      # (B, C)
+
+        scale_factors = sorted_vals.gather(-1, q_idx.unsqueeze(-1)).squeeze(-1)  # (B, C)
+
+        # Channels with no positives → leave unchanged (scale = 1, no clamp/divide)
+        valid = (n_pos > 0) & (scale_factors > 1e-8)
+        scale_factors = torch.where(valid, scale_factors, torch.ones_like(scale_factors))
+
+        # Clamp to [0, scale] then divide
+        scale_4d = scale_factors.view(B, C, 1, 1)
+        normalized = torch.clamp(acts, min=0.0, max=None)        # match original min=0 clamp
+        normalized = torch.minimum(normalized, scale_4d)
+        normalized = normalized / (scale_4d + 1e-8)
+
+        # For "invalid" channels the original returned acts unchanged → restore them
+        valid_4d = valid.view(B, C, 1, 1)
+        normalized = torch.where(valid_4d, normalized, acts)
 
         return normalized, scale_factors
 
