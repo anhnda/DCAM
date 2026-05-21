@@ -35,7 +35,7 @@ Usage:
     python check_drop_dcam.py
 
     # Explicit DCAM checkpoint
-    python check_drop_dcam.py --model resnet18 \\
+    python check_drop_dcam.py --model resnet18 \
         --dcam_model imagenet1k_dcam_resnet18_D128_seed42-42_result.pkl
 
     # Compare two model seeds (run twice and diff the printouts)
