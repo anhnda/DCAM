@@ -34,10 +34,22 @@ Supports multiple backbone architectures:
 - VGG16: features[16], 256 channels, 28x28 resolution
 - EfficientNet-B0: features[4], ~80 channels, 14x14 resolution
 
+Reproducibility:
+- Two independent seeds are used:
+    * --data_seed   (default 42): controls dataset sampling (random.sample in
+      create_sampled_dataset). Only has an effect when the sampled dataset is
+      actually (re)created; a pre-existing metadata.pkl cache is loaded as-is.
+    * --model_seed  (default 42): controls model weight initialization and
+      training-time stochasticity (batch sampling, shuffling, dropout, etc.).
+      Applied immediately before the ConvSAE is instantiated.
+- set_seed() seeds Python's random, NumPy, and PyTorch (CPU + all CUDA
+  devices), and enables deterministic cuDNN behavior.
+
 Usage:
     python run_xcsae_full.py
     python run_xcsae_full.py --model resnet18
     python run_xcsae_full.py --lambda_gradcam 1.0
+    python run_xcsae_full.py --data_seed 42 --model_seed 42
     python run_xcsae_full.py --force_reextract     # re-extract to populate gradcam maps
 """
 
@@ -88,6 +100,10 @@ ACTIVATION_CHUNK_SIZE = 100
 BATCH_SIZE_COLLECTION = 32
 BATCH_SIZE_TRAIN = 32
 
+# Default seeds (overridable via CLI)
+DEFAULT_DATA_SEED = 42
+DEFAULT_MODEL_SEED = 42
+
 MODEL_CONFIGS = {
     'resnet50': {
         'model_fn': lambda: models.resnet50(pretrained=True),
@@ -114,6 +130,37 @@ MODEL_CONFIGS = {
         'description': 'EfficientNet-B0 (features[4]: ~80ch, 14x14)'
     }
 }
+
+
+# ==========================================
+# Reproducibility helpers
+# ==========================================
+
+def set_seed(seed: int, deterministic: bool = True):
+    """Seed all relevant RNGs for reproducible behavior.
+
+    Seeds Python's `random`, NumPy, and PyTorch (CPU + all CUDA devices).
+    When `deterministic` is True, also configures cuDNN to behave
+    deterministically (at a possible cost to throughput).
+
+    Args:
+        seed: integer seed value.
+        deterministic: if True, set cuDNN deterministic / disable benchmark.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    print(f"  [seed] RNGs seeded with {seed} "
+          f"(cudnn deterministic={'on' if deterministic else 'off'})")
 
 
 # ==========================================
@@ -1049,6 +1096,16 @@ def main():
     parser.add_argument('--top_k', type=int, default=32)
     parser.add_argument('--model_suffix', type=str, default='', help='Optional suffix for model naming and logging')
 
+    # NEW: reproducibility seeds
+    parser.add_argument('--data_seed', type=int, default=DEFAULT_DATA_SEED,
+                       help='Random seed for dataset sampling (random.sample in '
+                            'create_sampled_dataset). Only affects runs that '
+                            'actually create the sampled dataset. Default: 42')
+    parser.add_argument('--model_seed', type=int, default=DEFAULT_MODEL_SEED,
+                       help='Random seed for model initialization and training '
+                            'stochasticity (weight init, batch shuffling/sampling). '
+                            'Default: 42')
+
     args = parser.parse_args()
 
     if args.batch_size is None:
@@ -1063,6 +1120,7 @@ def main():
     print(f"Multi-Channel ConvSAE Training on Full ImageNet-1k")
     print(f"Backbone: {args.model.upper()}")
     print(f"Grad-CAM Decomposition Constraint: ENABLED  (lambda_gradcam={args.lambda_gradcam})")
+    print(f"Seeds: data_seed={args.data_seed}, model_seed={args.model_seed}")
     print("="*80)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1072,6 +1130,10 @@ def main():
     print(f"\n{'='*80}")
     print("Setting up dataset...")
     print(f"{'='*80}")
+
+    # Seed for data sampling (controls random.sample in create_sampled_dataset).
+    print(f"Applying data seed:")
+    set_seed(args.data_seed)
 
     data_transform = transforms.Compose([
         transforms.Resize(256),
@@ -1132,6 +1194,8 @@ def main():
     print(f"  Batch Size: {args.batch_size} (GPU)")
     print(f"  Lambda GradCAM: {LAMBDA_GRADCAM}")
     print(f"  GradCAM normalization: {'OFF (raw MSE)' if args.gradcam_no_normalize else 'ON (per-sample L1 norm)'}")
+    print(f"  Data Seed: {args.data_seed}")
+    print(f"  Model Seed: {args.model_seed}")
     if args.accumulation_steps > 1:
         print(f"  Accumulation Steps: {args.accumulation_steps}")
         print(f"  Effective Batch Size: {effective_batch_size}")
@@ -1139,6 +1203,12 @@ def main():
     if torch.cuda.is_available():
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"  GPU Memory: {gpu_mem:.1f} GB")
+
+    # Seed for model initialization + training stochasticity (weight init,
+    # batch shuffling/sampling). Applied right before the model is created so
+    # the kaiming_normal_ initialization is reproducible.
+    print(f"\nApplying model seed:")
+    set_seed(args.model_seed)
 
     csae_model = MultiChannelConvSAE(
         in_channels=INPUT_CHANNELS,
@@ -1164,6 +1234,11 @@ def main():
 
     num_classes = len(train_dataset.class_to_indices)
 
+    # Generator that drives DataLoader shuffling / batch sampling, seeded from
+    # the model seed so the training data ordering is reproducible.
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.model_seed)
+
     if num_classes <= 100:
         print(f"\nUsing class-balanced batch sampling ({num_classes} classes)")
         batch_sampler = ClassBalancedBatchSampler(
@@ -1179,7 +1254,8 @@ def main():
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            drop_last=True
+            drop_last=True,
+            generator=train_generator
         )
 
     logs = {
@@ -1272,6 +1348,8 @@ def main():
     if args.target_layer:
         layer_suffix = args.target_layer.replace('[', '_').replace(']', '')
         output_prefix += f"_{layer_suffix}"
+    # Seeds in the filename: seed{data_seed}-{model_seed}
+    output_prefix += f"_seed{args.data_seed}-{args.model_seed}"
 
     torch.save(csae_model.state_dict(), f'{output_prefix}{args.model_suffix}_model.pth')
     joblib.dump(csae_model.cpu(), f'{output_prefix}{args.model_suffix }_model.pkl')
@@ -1287,6 +1365,8 @@ def main():
             'lr': args.lr,
             'lambda_gradcam': LAMBDA_GRADCAM,
             'gradcam_normalize': not args.gradcam_no_normalize,
+            'data_seed': args.data_seed,
+            'model_seed': args.model_seed,
         },
         'logs': logs,
         'final_metrics': avg_metrics
