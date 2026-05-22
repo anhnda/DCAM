@@ -56,7 +56,6 @@ Usage:
 
 import torch
 
-from patch_dcam_percell_anchor import build_dcam_anchor_percell
 torch.cuda.init()
 
 import torch.nn as nn
