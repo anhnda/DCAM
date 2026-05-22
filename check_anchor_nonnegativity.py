@@ -1,53 +1,54 @@
 """
 check_anchor_nonnegativity.py
 =============================
-Decide whether "NMF anchor is bad" means (a) the solver is bad, or
-(b) non-negativity is the wrong prior for this layer.
+Diagnose the DCAM anchor: rank, non-negativity, and atom-stability of the
+channel co-activation matrix S.
 
-The test
---------
-S is the C x C channel co-activation matrix (PSD, rank <= C). We factorize it
-at rank D in three ways and compare relative reconstruction error
-||S - S_hat||_F / ||S||_F:
+Four analyses
+-------------
+1. NON-NEGATIVITY GAP. Factorize S at rank D three ways and compare relative
+   error ||S - S_hat||_F / ||S||_F:
+     - signed eig: best symmetric rank-D fit (any sign). The floor.
+     - signed GG^T: PSD signed fit, the fair analogue of NMF's W W^T.
+     - NMF W W^T (W >= 0): the anchor's factorization, run to convergence.
+   gap = err_NMF - err_signed. gap ~ 0 => non-negativity is cheap (any anchor
+   failure is a SOLVER problem). gap large => S has no good non-negative
+   factorization (the premise is broken).
 
-  1. SIGNED truncated eigendecomposition  S ~ U L U^T  (rank D).
-     This is the BEST possible symmetric rank-D fit. For D >= C it is
-     ESSENTIALLY ZERO by construction. It is the floor.
+2. EFFECTIVE RANK. Participation ratio (sum l)^2/sum(l^2), entropy rank, and
+   eigenvalue counts. A steep spectrum means only ~R directions carry signal;
+   asking for D >> R atoms factorizes a noise floor.
 
-  2. SIGNED low-rank  S ~ G G^T  with G in R^{C x D}, G unconstrained.
-     Same error as (1) -- included only as a sanity check / explicit
-     "G G^T" form matching the anchor's W W^T shape.
+3. ATOM-STABILITY SWEEP. For each D, run NMF from several seeds and measure
+   how much the atom sets disagree (Hungarian-matched distance). Turns
+   "atoms split and absorb" into a number. Prediction: stable at D ~ R,
+   unstable once D >> R.
 
-  3. NMF  S ~ W W^T  with W >= 0  (the anchor: build_anchor's factorization).
-     Run to convergence (many iters, normalized S, multi-restart).
-
-Interpretation
---------------
-  gap := err_NMF - err_signed   at a given D.
-  * gap ~ 0            -> non-negativity costs nothing; if your build_anchor
-                          still fails, it's a SOLVER problem (iters/init/norm).
-  * gap large (>> 0)   -> S has no good NON-NEGATIVE factorization. Since
-                          err_signed is ~0 at D >= C, a large NMF error is
-                          ENTIRELY the cost of the W >= 0 constraint. The
-                          non-negative-anchor / soft-membership premise does
-                          not hold for this layer.
+4. PER-CELL RANK CHECK (--percell_rank). S is built from spatially-AVERAGED
+   activations; averaging can crush rank. This streams the per-cell channel
+   covariance and compares its effective rank to S's. Decides whether a
+   near-low-rank spectrum is a property of the LAYER or only of the anchor's
+   averaged construction.
 
 Memory
 ------
-Activations are NEVER fully loaded. Cache chunks are streamed one at a time:
-each [n, C, H, W] chunk is spatially averaged to [n, C] and accumulated into
-a [C, C] matrix, then freed. Peak extra RAM is one chunk (~tens of MB).
-Optionally subsample chunks with --max_chunks for an even lighter pass.
+Activations are NEVER fully loaded. Cache chunks are streamed one at a time
+and reduced to a [C, C] matrix, then freed. Peak extra RAM is one chunk.
+--max_chunks / --subsample_rows / --percell_subsample lighten it further.
 
 Usage
 -----
+    # full sweep over the small-D regime where the rank elbow lives
     python check_anchor_nonnegativity.py \\
         --cache_dir cache_activations \\
-        --cache_key <the activations_... dir name> \\
-        --D 1000 4000
+        --cache_key <activations_... dir> \\
+        --D 10 25 50 100 200 512 \\
+        --percell_rank --device cuda
 
-If you don't know the cache key, run with --list to see available caches.
-You can also point --S_path at a precomputed S .pt/.npy to skip streaming.
+    # reuse a precomputed S (skips streaming; per-cell check still needs cache)
+    python check_anchor_nonnegativity.py --S_path anchor_nonnegativity_check_S.npy
+
+If you don't know the cache key, run with --list.
 """
 
 import argparse
@@ -153,6 +154,125 @@ def build_S_streaming(cache_path: Path, max_chunks=None, subsample_rows=None):
     S /= max(n_total, 1)
     print(f"Built S: shape {S.shape}, {n_total} images.")
     return S, n_total
+
+
+def build_S_percell_streaming(cache_path: Path, max_chunks=None,
+                              subsample_cells=None):
+    """Build the PER-CELL channel covariance  S_cell = E[ a a^T ]  where a is
+    the C-vector of activations at ONE spatial cell (not spatially averaged).
+
+    Why this exists
+    ---------------
+    The main S in build_S_streaming uses Abar = spatial MEAN over H,W. Spatial
+    averaging can crush rank: it is plausible the near-low-rank spectrum is an
+    artifact of averaging, and the per-cell activations the encoder actually
+    sees are much higher rank. If S_cell is ALSO near-low-rank, the
+    "layer supports only ~R concepts" conclusion is about the LAYER and is
+    safe to put in the paper. If S_cell is high rank, the conclusion is only
+    about the anchor's averaged construction -- a finding about build_anchor,
+    not the layer.
+
+    Memory: identical streaming discipline -- one chunk resident at a time.
+    Each [n, C, H, W] chunk is reshaped to [n*H*W, C] cells; cells are
+    optionally subsampled (there are n*H*W of them, e.g. 100*196 per chunk),
+    then accumulated into the C x C matrix.
+
+    Returns:
+        S_cell [C, C] float64 ndarray, total cell count used.
+    """
+    parts = sorted(cache_path.glob("part_*.pkl"))
+    if not parts:
+        raise FileNotFoundError(f"No part_*.pkl in {cache_path}")
+    if max_chunks is not None:
+        parts = parts[:max_chunks]
+
+    print(f"Streaming {len(parts)} part(s) for PER-CELL covariance "
+          f"from {cache_path.name} ...")
+    S = None
+    n_cells = 0
+    rng = np.random.default_rng(0)
+
+    for i, p in enumerate(parts):
+        part = joblib.load(p)
+        act = _to_numpy(part["activation"])         # [n, C, H, W]
+        if act.ndim == 4:
+            n, C, H, W = act.shape
+            # [n, C, H, W] -> [n*H*W, C]
+            cells = act.transpose(0, 2, 3, 1).reshape(-1, C)
+        elif act.ndim == 2:
+            cells = act
+        else:
+            raise ValueError(f"unexpected activation ndim {act.ndim} in {p}")
+
+        if subsample_cells is not None and cells.shape[0] > subsample_cells:
+            keep = rng.choice(cells.shape[0], subsample_cells, replace=False)
+            cells = cells[keep]
+
+        if S is None:
+            S = np.zeros((cells.shape[1], cells.shape[1]), dtype=np.float64)
+        S += cells.T @ cells
+        n_cells += cells.shape[0]
+
+        del part, act, cells
+        if (i + 1) % 10 == 0 or (i + 1) == len(parts):
+            print(f"  ...{i + 1}/{len(parts)} chunks, "
+                  f"{n_cells} cells so far")
+
+    S /= max(n_cells, 1)
+    print(f"Built S_cell: shape {S.shape}, {n_cells} spatial cells.")
+    return S, n_cells
+
+
+def effective_rank_metrics(evals):
+    """Summarize how concentrated a PSD spectrum is -- i.e. how many
+    directions actually carry signal.
+
+    Args:
+        evals: 1-D array of eigenvalues, DESCENDING order.
+    Returns:
+        dict with:
+          participation_ratio : (sum l)^2 / sum(l^2). Equals the true rank
+                                 for a flat spectrum, ~1 for a rank-1 spike.
+                                 The single most honest "effective rank".
+          entropy_rank        : exp(Shannon entropy of the normalized
+                                 spectrum) -- another standard effective rank.
+          n_above_1pct        : count of eigenvalues > 1% of the largest.
+          n_above_0p1pct      : count of eigenvalues > 0.1% of the largest.
+          n_90 / n_95 / n_99  : how many eigenvalues to reach that fraction
+                                 of total positive energy.
+    """
+    ev = np.asarray(evals, dtype=np.float64)
+    pos = ev[ev > 0]
+    if len(pos) == 0:
+        return {}
+    s1 = pos.sum()
+    s2 = (pos ** 2).sum()
+    participation = float(s1 * s1 / (s2 + 1e-30))
+    p = pos / s1
+    entropy = float(np.exp(-(p * np.log(p + 1e-30)).sum()))
+    cume = np.cumsum(pos) / s1
+
+    def n_for(frac):
+        idx = np.searchsorted(cume, frac)
+        return int(min(idx + 1, len(pos)))
+
+    return {
+        "participation_ratio": participation,
+        "entropy_rank": entropy,
+        "n_above_1pct": int((pos > 0.01 * pos[0]).sum()),
+        "n_above_0p1pct": int((pos > 0.001 * pos[0]).sum()),
+        "n_90": n_for(0.90),
+        "n_95": n_for(0.95),
+        "n_99": n_for(0.99),
+    }
+
+
+def spectrum_of(S, device="cpu"):
+    """Descending eigenvalues of a symmetric matrix S (GPU eigh if available)."""
+    if torch is not None:
+        evt = torch.linalg.eigvalsh(_as_tensor(S, device))
+        return evt.flip(0).cpu().numpy()
+    return np.linalg.eigvalsh(S)[::-1]
 
 
 # ----------------------------------------------------------------------
@@ -313,6 +433,97 @@ def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
 
 
 # ----------------------------------------------------------------------
+# Atom-stability across seeds
+# ----------------------------------------------------------------------
+
+def _l1_normalize_rows(M):
+    """Row-L1-normalize a [D, C] matrix (atoms as rows on the L1 simplex).
+    Mirrors what build_anchor does before comparing atoms."""
+    s = np.abs(M).sum(axis=1, keepdims=True)
+    s[s < 1e-12] = 1.0
+    return M / s
+
+
+def matched_atom_distance(W_a, W_b):
+    """Permutation-invariant distance between two atom sets.
+
+    W_a, W_b are NMF factors [C, D]. Atoms are the COLUMNS; we compare them
+    as rows-over-channels (transpose), L1-normalized, via a Hungarian
+    matching on pairwise L2 distance -- the same construction as
+    run_dcam_full.atom_distance, so the numbers are comparable to DCAM's.
+
+    Returns:
+        mean_matched_l2 : average L2 distance between matched atom pairs.
+                          Scale-comparable across different D (it is a mean,
+                          not a sum).
+        frac_unmatched  : fraction of atoms whose matched distance exceeds a
+                          'basically a different atom' threshold (0.5 of the
+                          max possible L1-simplex distance, ~sqrt(2)).
+    """
+    from scipy.optimize import linear_sum_assignment
+    A = _l1_normalize_rows(np.asarray(W_a, dtype=np.float64).T)  # [D, C]
+    B = _l1_normalize_rows(np.asarray(W_b, dtype=np.float64).T)  # [D, C]
+    D = min(A.shape[0], B.shape[0])
+    A, B = A[:D], B[:D]
+    # pairwise L2 cost matrix
+    cost = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)  # [D, D]
+    r, c = linear_sum_assignment(cost)
+    matched = cost[r, c]
+    mean_matched = float(matched.mean())
+    # two L1-simplex points are maximally ~sqrt(2) apart; >0.5*sqrt(2)
+    # means the matched partner is essentially a different atom.
+    frac_unmatched = float((matched > 0.5 * np.sqrt(2.0)).mean())
+    return mean_matched, frac_unmatched
+
+
+def atom_stability_sweep(S, D_list, seeds, iters, restarts, normalize,
+                         device="cpu", verbose=False):
+    """For each D, run NMF from several DIFFERENT seeds and measure how much
+    the resulting atom sets disagree (mean pairwise matched-atom distance).
+
+    This is the experiment that turns "atoms split and absorb" from an
+    observation into a number. The prediction: stable (small distance) at D
+    near the effective rank, degrading sharply once D far exceeds it, because
+    beyond the effective rank the extra atoms fit a noise floor and are
+    determined by the init rather than by S.
+
+    Args:
+        S: [C, C] co-activation matrix.
+        D_list: ranks to test.
+        seeds: list of NMF seeds (>= 2). Each gives one atom set per D.
+        iters, restarts, normalize: passed to nmf_symmetric. NOTE restarts is
+            forced to 1 here -- we want each SEED to give one deterministic
+            solution, not a best-of-restarts, so the comparison is honest.
+    Returns:
+        list of dicts: {D, mean_dist, std_dist, mean_frac_unmatched}.
+    """
+    out = []
+    for D in D_list:
+        Ws = []
+        for sd in seeds:
+            W, e, _ = nmf_symmetric(
+                S, D, iters=iters, restarts=1, normalize=normalize,
+                seed=sd, verbose=False, device=device)
+            Ws.append(W)
+        # all unordered seed pairs
+        dists, fracs = [], []
+        for i in range(len(Ws)):
+            for j in range(i + 1, len(Ws)):
+                md, fu = matched_atom_distance(Ws[i], Ws[j])
+                dists.append(md)
+                fracs.append(fu)
+        mean_d = float(np.mean(dists)) if dists else float("nan")
+        std_d = float(np.std(dists)) if dists else float("nan")
+        mean_f = float(np.mean(fracs)) if fracs else float("nan")
+        print(f"  [stability D={D}] mean matched-atom dist = {mean_d:.4f} "
+              f"+/- {std_d:.4f}   frac 'different atom' = {mean_f:.3f}  "
+              f"({len(dists)} seed-pairs)")
+        out.append(dict(D=D, mean_dist=mean_d, std_dist=std_d,
+                        mean_frac_unmatched=mean_f))
+    return out
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 
@@ -329,8 +540,10 @@ def main():
     ap.add_argument("--S_path", type=str, default=None,
                     help="Optional: load a precomputed S (.npy/.pt) and skip "
                          "streaming entirely.")
-    ap.add_argument("--D", type=int, nargs="+", default=[1000, 4000],
-                    help="Ranks D to test.")
+    ap.add_argument("--D", type=int, nargs="+",
+                    default=[10, 25, 50, 100, 200, 512],
+                    help="Ranks D to test. Default spans the small-D regime "
+                         "where the effective-rank elbow lives.")
     ap.add_argument("--max_chunks", type=int, default=None,
                     help="Stream at most this many chunks (subsample).")
     ap.add_argument("--subsample_rows", type=int, default=None,
@@ -340,6 +553,26 @@ def main():
     ap.add_argument("--no_normalize", action="store_true",
                     help="Disable correlation-matrix normalization of S "
                          "before NMF.")
+    ap.add_argument("--stability_seeds", type=int, nargs="+",
+                    default=[0, 1, 2],
+                    help="NMF seeds for the atom-stability sweep. Each seed "
+                         "yields one atom set per D; pairwise matched-atom "
+                         "distance measures seed-stability. Pass an empty "
+                         "list / use --no_stability to skip.")
+    ap.add_argument("--no_stability", action="store_true",
+                    help="Skip the multi-seed atom-stability sweep.")
+    ap.add_argument("--stability_iters", type=int, default=2000,
+                    help="NMF iters for the stability sweep (each seed run "
+                         "uses restarts=1). Lower than --nmf_iters since many "
+                         "runs are needed; raise if traces look undertrained.")
+    ap.add_argument("--percell_rank", action="store_true",
+                    help="Also stream the PER-CELL channel covariance and "
+                         "report its effective rank. Decides whether the "
+                         "near-low-rank spectrum is a property of the LAYER "
+                         "or only of the spatially-averaged anchor S.")
+    ap.add_argument("--percell_subsample", type=int, default=20000,
+                    help="Max spatial cells kept per chunk for the per-cell "
+                         "covariance (memory control).")
     ap.add_argument("--out_prefix", type=str,
                     default="anchor_nonnegativity_check")
     ap.add_argument("--device", type=str, default="cuda",
@@ -388,27 +621,77 @@ def main():
     # symmetrize defensively
     S = 0.5 * (S + S.T)
 
-    # ---- spectrum summary ---------------------------------------------
-    if torch is not None:
-        _evt = torch.linalg.eigvalsh(
-            torch.as_tensor(S, dtype=torch.float64, device=device))
-        evals = _evt.flip(0).cpu().numpy()          # descending
-    else:
-        evals = np.linalg.eigvalsh(S)[::-1]         # descending
+    # ---- spectrum summary + effective rank ----------------------------
+    evals = spectrum_of(S, device=device)
     pos = evals[evals > 0]
-    print(f"\nS spectrum: C={C}")
+    erm = effective_rank_metrics(evals)
+    print(f"\nS spectrum (spatially-averaged co-activation): C={C}")
     print(f"  rank(S) (eigs > 1e-9 * max): "
           f"{int((evals > 1e-9 * evals[0]).sum())}")
     print(f"  top 5 eigenvalues:    {np.round(evals[:5], 5)}")
     print(f"  # negative eigenvalues: {int((evals < 0).sum())} "
           f"(should be ~0 for a PSD S)")
+    print(f"  EFFECTIVE RANK:")
+    print(f"    participation ratio (sum l)^2/sum l^2 : "
+          f"{erm['participation_ratio']:.2f}")
+    print(f"    entropy rank exp(H)                   : "
+          f"{erm['entropy_rank']:.2f}")
+    print(f"    # eigenvalues > 1%  of max            : {erm['n_above_1pct']}")
+    print(f"    # eigenvalues > 0.1% of max           : "
+          f"{erm['n_above_0p1pct']}")
+    print(f"    eigenvalues to reach 90/95/99% energy : "
+          f"{erm['n_90']} / {erm['n_95']} / {erm['n_99']}")
     if len(pos) > 0:
-        # how much energy in the top-k
         cume = np.cumsum(pos) / pos.sum()
         for k in (10, 50, 100, 256, 512, 1024):
             if k <= len(pos):
                 print(f"  top-{k} eigenvalues hold "
                       f"{100 * cume[k - 1]:.1f}% of positive energy")
+
+    # ---- per-cell rank check (optional) -------------------------------
+    # Decides whether the near-low-rank spectrum is a property of the LAYER
+    # or only an artifact of spatial averaging in the anchor's S.
+    percell_evals = None
+    percell_erm = None
+    if args.percell_rank:
+        if args.S_path is not None and args.cache_key is None:
+            print("\n[per-cell] WARNING: --percell_rank needs the activation "
+                  "cache (--cache_key), not just --S_path. Skipping.")
+        elif joblib is None:
+            print("\n[per-cell] joblib unavailable; skipping per-cell check.")
+        else:
+            print(f"\n{'=' * 60}\nPER-CELL RANK CHECK\n{'=' * 60}")
+            cache_path = cache_dir / args.cache_key
+            S_cell, n_cells = build_S_percell_streaming(
+                cache_path, max_chunks=args.max_chunks,
+                subsample_cells=args.percell_subsample)
+            S_cell = 0.5 * (S_cell + S_cell.T)
+            np.save(f"{args.out_prefix}_S_percell.npy", S_cell)
+            percell_evals = spectrum_of(S_cell, device=device)
+            percell_erm = effective_rank_metrics(percell_evals)
+            print(f"  PER-CELL effective rank:")
+            print(f"    participation ratio : "
+                  f"{percell_erm['participation_ratio']:.2f}")
+            print(f"    entropy rank        : "
+                  f"{percell_erm['entropy_rank']:.2f}")
+            print(f"    # eigs > 1% of max  : {percell_erm['n_above_1pct']}")
+            print(f"    eigs to 90/95/99%   : {percell_erm['n_90']} / "
+                  f"{percell_erm['n_95']} / {percell_erm['n_99']}")
+            pr_avg = erm['participation_ratio']
+            pr_cell = percell_erm['participation_ratio']
+            if pr_cell > 3 * pr_avg:
+                print(f"  --> PER-CELL rank ({pr_cell:.0f}) is much higher "
+                      f"than averaged-S rank ({pr_avg:.0f}). The low rank is "
+                      f"an ARTIFACT of spatial averaging in the anchor's S, "
+                      f"not a property of the layer. The 'layer supports "
+                      f"only ~R concepts' claim is NOT supported -- this is a "
+                      f"finding about build_anchor's construction instead.")
+            else:
+                print(f"  --> PER-CELL rank ({pr_cell:.0f}) is comparable to "
+                      f"averaged-S rank ({pr_avg:.0f}). The near-low-rank "
+                      f"structure is a property of the LAYER itself; the "
+                      f"'limited number of stable concepts' conclusion is "
+                      f"safe to state for the layer.")
 
     # ---- factorize at each D ------------------------------------------
     results = []
@@ -453,65 +736,163 @@ def main():
         print(f"  D={D}: signed GG^T err={r['e_ggt']:.4f}, "
               f"NMF err={r['e_nmf']:.4f}, gap={r['gap']:.4f}\n      {msg}")
 
+    # ---- atom-stability sweep -----------------------------------------
+    stability = []
+    if not args.no_stability and len(args.stability_seeds) >= 2:
+        print(f"\n{'=' * 60}\nATOM-STABILITY SWEEP "
+              f"(seeds={args.stability_seeds})\n{'=' * 60}")
+        print("Running NMF from each seed at each D; comparing atom sets "
+              "by Hungarian-matched distance.")
+        stability = atom_stability_sweep(
+            S, args.D, seeds=args.stability_seeds,
+            iters=args.stability_iters, restarts=1,
+            normalize=not args.no_normalize, device=device)
+        # interpret: where does it stop being stable?
+        stable_Ds = [s["D"] for s in stability if s["mean_dist"] < 0.10]
+        if stable_Ds:
+            print(f"\n  Atoms are seed-stable (mean dist < 0.10) up to "
+                  f"D <= {max(stable_Ds)}.")
+        else:
+            print(f"\n  No tested D is seed-stable below the 0.10 threshold.")
+        unstable_Ds = [s["D"] for s in stability if s["mean_dist"] >= 0.10]
+        if stable_Ds and unstable_Ds:
+            print(f"  Instability sets in by D >= {min(unstable_Ds)}. "
+                  f"If this elbow matches the effective rank "
+                  f"(~{erm['n_above_1pct']}), the instability is explained: "
+                  f"atoms beyond the effective rank fit a noise floor and "
+                  f"are determined by the init, not by S.")
+
     # ---- plot ----------------------------------------------------------
-    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Anchor non-negativity check: signed low-rank vs NMF on S",
+    fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Anchor analysis: rank, non-negativity, and atom-stability",
                  fontsize=13, fontweight="bold")
 
-    # (a) error vs D, bar chart
+    # (0,0) error vs D, grouped bars
     Ds = [r["D"] for r in results]
     x = np.arange(len(Ds))
     w = 0.27
-    axs[0].bar(x - w, [r["e_eig"] for r in results], w,
-               label="signed eig (any sign)", color="seagreen")
-    axs[0].bar(x, [r["e_ggt"] for r in results], w,
-               label="signed GG^T (PSD)", color="steelblue")
-    axs[0].bar(x + w, [r["e_nmf"] for r in results], w,
-               label="NMF W W^T (W>=0)", color="crimson")
-    axs[0].set_xticks(x)
-    axs[0].set_xticklabels([f"D={d}" for d in Ds])
-    axs[0].set_ylabel("relative reconstruction error  ||S - S_hat||_F / ||S||_F")
-    axs[0].set_title("Reconstruction error by method and D")
-    axs[0].legend(fontsize=8)
-    axs[0].grid(True, axis="y", alpha=0.3)
+    axs[0, 0].bar(x - w, [r["e_eig"] for r in results], w,
+                  label="signed eig (any sign)", color="seagreen")
+    axs[0, 0].bar(x, [r["e_ggt"] for r in results], w,
+                  label="signed GG^T (PSD)", color="steelblue")
+    axs[0, 0].bar(x + w, [r["e_nmf"] for r in results], w,
+                  label="NMF W W^T (W>=0)", color="crimson")
+    axs[0, 0].set_xticks(x)
+    axs[0, 0].set_xticklabels([f"{d}" for d in Ds])
+    axs[0, 0].set_xlabel("D")
+    axs[0, 0].set_ylabel("rel. reconstruction error")
+    axs[0, 0].set_title("Reconstruction error by method and D")
+    axs[0, 0].legend(fontsize=8)
+    axs[0, 0].grid(True, axis="y", alpha=0.3)
 
-    # (b) the non-negativity gap
-    axs[1].bar(x, [r["gap"] for r in results], 0.5, color="darkorange")
-    axs[1].axhline(0.20, color="red", ls="--", lw=0.8,
-                   label="0.20: 'premise broken' threshold")
-    axs[1].axhline(0.05, color="green", ls="--", lw=0.8,
-                   label="0.05: 'solver problem' threshold")
-    axs[1].set_xticks(x)
-    axs[1].set_xticklabels([f"D={d}" for d in Ds])
-    axs[1].set_title("Non-negativity gap  (NMF err - signed GG^T err)")
-    axs[1].set_ylabel("gap")
-    axs[1].legend(fontsize=8)
-    axs[1].grid(True, axis="y", alpha=0.3)
+    # (0,1) non-negativity gap
+    axs[0, 1].bar(x, [r["gap"] for r in results], 0.5, color="darkorange")
+    axs[0, 1].axhline(0.20, color="red", ls="--", lw=0.8,
+                      label="0.20: premise-broken")
+    axs[0, 1].axhline(0.05, color="green", ls="--", lw=0.8,
+                      label="0.05: solver-problem")
+    axs[0, 1].set_xticks(x)
+    axs[0, 1].set_xticklabels([f"{d}" for d in Ds])
+    axs[0, 1].set_xlabel("D")
+    axs[0, 1].set_title("Non-negativity gap (NMF - signed GG^T)")
+    axs[0, 1].set_ylabel("gap")
+    axs[0, 1].legend(fontsize=8)
+    axs[0, 1].grid(True, axis="y", alpha=0.3)
 
-    # (c) NMF convergence traces
+    # (0,2) NMF convergence traces
     for r in results:
         if r["trace"]:
             its = [t[0] for t in r["trace"]]
             es = [t[1] for t in r["trace"]]
-            axs[2].plot(its, es, lw=1.5, label=f"D={r['D']}")
-    axs[2].set_xlabel("NMF iteration")
-    axs[2].set_ylabel("rel_err (normalized S)")
-    axs[2].set_title("NMF convergence trace (is it still descending?)")
-    axs[2].legend(fontsize=8)
-    axs[2].grid(True, alpha=0.3)
+            axs[0, 2].plot(its, es, lw=1.5, label=f"D={r['D']}")
+    axs[0, 2].set_xlabel("NMF iteration")
+    axs[0, 2].set_ylabel("rel_err (normalized S)")
+    axs[0, 2].set_title("NMF convergence trace")
+    axs[0, 2].legend(fontsize=8)
+    axs[0, 2].grid(True, alpha=0.3)
+
+    # (1,0) SCREE PLOT -- log eigenvalue spectrum, with effective rank marked
+    rank_idx = np.arange(1, len(evals) + 1)
+    axs[1, 0].semilogy(rank_idx, np.clip(evals, 1e-12, None),
+                       color="navy", lw=1.5, label="S (averaged)")
+    pr = erm["participation_ratio"]
+    axs[1, 0].axvline(pr, color="crimson", ls="--", lw=1.0,
+                      label=f"participation rank ~{pr:.0f}")
+    axs[1, 0].axvline(erm["n_above_1pct"], color="darkorange", ls=":",
+                      lw=1.0, label=f"# eigs>1% = {erm['n_above_1pct']}")
+    if percell_evals is not None:
+        pc_idx = np.arange(1, len(percell_evals) + 1)
+        axs[1, 0].semilogy(pc_idx, np.clip(percell_evals, 1e-12, None),
+                           color="teal", lw=1.5, alpha=0.8,
+                           label="S (per-cell)")
+    axs[1, 0].set_xlabel("eigenvalue index")
+    axs[1, 0].set_ylabel("eigenvalue (log)")
+    axs[1, 0].set_title("Scree plot -- spectrum & effective rank")
+    axs[1, 0].legend(fontsize=8)
+    axs[1, 0].grid(True, which="both", alpha=0.3)
+
+    # (1,1) cumulative energy
+    if len(pos) > 0:
+        cume = np.cumsum(pos) / pos.sum()
+        axs[1, 1].plot(np.arange(1, len(cume) + 1), cume,
+                       color="navy", lw=1.5)
+        for frac, c in ((0.90, "green"), (0.95, "orange"), (0.99, "red")):
+            axs[1, 1].axhline(frac, color=c, ls="--", lw=0.7)
+        axs[1, 1].set_xlabel("# eigenvalues")
+        axs[1, 1].set_ylabel("cumulative energy fraction")
+        axs[1, 1].set_title("Cumulative spectral energy")
+        axs[1, 1].set_xscale("log")
+        axs[1, 1].grid(True, which="both", alpha=0.3)
+
+    # (1,2) ATOM-STABILITY vs D
+    if stability:
+        sD = [s["D"] for s in stability]
+        sM = [s["mean_dist"] for s in stability]
+        sS = [s["std_dist"] for s in stability]
+        axs[1, 2].errorbar(sD, sM, yerr=sS, marker="o", lw=1.5,
+                           color="darkviolet", capsize=3,
+                           label="mean matched-atom dist")
+        axs[1, 2].axhline(0.10, color="green", ls="--", lw=0.8,
+                          label="0.10: 'stable' threshold")
+        axs[1, 2].axvline(pr, color="crimson", ls=":", lw=1.0,
+                          label=f"effective rank ~{pr:.0f}")
+        axs[1, 2].set_xlabel("D")
+        axs[1, 2].set_ylabel("mean matched-atom distance (across seeds)")
+        axs[1, 2].set_title("Atom seed-stability vs D")
+        axs[1, 2].set_xscale("log")
+        axs[1, 2].legend(fontsize=8)
+        axs[1, 2].grid(True, which="both", alpha=0.3)
+    else:
+        axs[1, 2].text(0.5, 0.5, "atom-stability sweep skipped\n"
+                       "(--no_stability or <2 seeds)",
+                       ha="center", va="center", fontsize=10)
+        axs[1, 2].set_title("Atom seed-stability vs D")
 
     plt.tight_layout()
     out_png = f"{args.out_prefix}.png"
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     print(f"\nPlot saved to {out_png}")
 
-    # ---- numeric table -------------------------------------------------
+    # ---- numeric tables -----------------------------------------------
     out_txt = f"{args.out_prefix}.txt"
     with open(out_txt, "w") as f:
-        f.write("D\tsigned_eig\tsigned_GGt\tNMF\tgap\n")
+        f.write("# effective rank of S (spatially-averaged co-activation)\n")
+        for k, v in erm.items():
+            f.write(f"#   {k}\t{v}\n")
+        if percell_erm is not None:
+            f.write("# effective rank of S_percell\n")
+            for k, v in percell_erm.items():
+                f.write(f"#   {k}\t{v}\n")
+        f.write("\nD\tsigned_eig\tsigned_GGt\tNMF\tgap\n")
         for r in results:
             f.write(f"{r['D']}\t{r['e_eig']:.6f}\t{r['e_ggt']:.6f}\t"
                     f"{r['e_nmf']:.6f}\t{r['gap']:.6f}\n")
+        if stability:
+            f.write("\nD\tmean_atom_dist\tstd_atom_dist\tfrac_diff_atom\n")
+            for s in stability:
+                f.write(f"{s['D']}\t{s['mean_dist']:.6f}\t"
+                        f"{s['std_dist']:.6f}\t"
+                        f"{s['mean_frac_unmatched']:.6f}\n")
     print(f"Numeric results saved to {out_txt}")
 
 
