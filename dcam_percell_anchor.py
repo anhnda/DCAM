@@ -25,14 +25,25 @@ Build the anchor from the PER-CELL channel covariance instead:
     S_cell[k,k'] = E_cell[ a_k a_k' ]      a = activations at one (h,w) cell
 
 i.e. accumulate over every spatial cell, not over per-image spatial means.
-Everything else in build_anchor (symmetric NMF, simplex projection,
-non-degeneracy merge) is unchanged.
+
+Solver note (important)
+-----------------------
+build_anchor's symmetric NMF uses multiplicative updates with a [0,1] random
+init and NO rescaling. On the per-cell S -- whose entries are much larger
+than the averaged S's, because no spatial averaging shrinks them -- that NMF
+STALLS: it reported rel_err ~285 (a relative error should be in [0,~1]; 285
+means the factorization never converged). So this module does NOT call
+build_anchor's NMF. It uses check_anchor_nonnegativity.nmf_symmetric, which
+rescales the init to S's magnitude and correlation-normalizes S first --
+the two things that make NMF converge on a large-magnitude matrix. The
+non-degeneracy merge is reimplemented locally (_merge_near_duplicate_atoms)
+so nothing depends on build_anchor's weak NMF path.
 
 This module provides:
   * compute_coactivation_matrix_percell(): the corrected S.
-  * build_anchor_percell(): thin wrapper that calls the original build_anchor
-    on the corrected S, with stronger NMF defaults (the diagnostic showed
-    build_anchor's 500 iters were undertrained; 4000 + normalization is safe).
+  * build_anchor_percell(): per-cell S + converging NMF + simplex projection
+    + non-degeneracy merge. Reports the NMF rel_err and warns if it did not
+    converge -- so a stability verdict is never read off an unconverged fit.
 
 How to use it in run_dcam_full.py
 ---------------------------------
@@ -45,14 +56,15 @@ In main(), replace the anchor block:
     # NEW:
     from dcam_percell_anchor import build_anchor_percell
     Pi0, nu, D_eff = build_anchor_percell(
-        act_chunks, D, nmf_iters=args.nmf_iters,
+        act_chunks, D, nmf_iters=max(args.nmf_iters, 8000),
         merge_tol=args.merge_tol, seed=args.anchor_seed,
-        subsample_cells=args.percell_subsample)
+        subsample_cells=200000, device=str(device))
 
-Nothing else in DCAM changes: the encoder, the tied pinv decoder, the three
-loss terms, and the simplex projection are all untouched. This isolates the
-anchor as the single variable, so any change in DCAM's accuracy is
-attributable to the anchor and nothing else.
+Note: bump nmf_iters to >= 8000 -- the per-cell S is large-magnitude and
+high-rank, so it needs more iterations than the averaged S did. Pass
+device=str(device) so the NMF runs on the same GPU as training. Nothing
+else in DCAM changes: encoder, tied pinv decoder, three loss terms, simplex
+projection -- all untouched. This isolates the anchor as the single variable.
 
 IMPORTANT -- this is a partial fix
 ----------------------------------
@@ -70,8 +82,53 @@ import numpy as np
 from typing import List, Tuple
 from tqdm import tqdm
 
-# Reuse the original, unchanged anchor machinery.
-from run_dcam_full import build_anchor, project_rows_to_simplex
+# Reuse the original simplex projection from DCAM.
+from run_dcam_full import project_rows_to_simplex
+# Reuse the CONVERGING NMF solver from the diagnostic script. This solver
+# rescales the init to S's magnitude and correlation-normalizes S before
+# factorizing -- exactly the two things build_anchor's multiplicative-update
+# NMF lacked, which is why build_anchor's NMF stalled at rel_err ~285 on the
+# (large-magnitude) per-cell S. We must NOT use build_anchor's NMF here.
+from check_anchor_nonnegativity import nmf_symmetric
+
+
+def _merge_near_duplicate_atoms(Pi0: torch.Tensor, merge_tol: float
+                                ) -> Tuple[torch.Tensor, float, int]:
+    """Non-degeneracy check: merge anchor rows closer than merge_tol (L2),
+    re-project the merged row to the simplex, and report nu = min pairwise
+    atom distance. Reimplemented from build_anchor so this module does not
+    depend on build_anchor's (weak-NMF) code path.
+
+    Args:
+        Pi0: [D, C] anchor, rows already on the L1-simplex.
+        merge_tol: rows closer than this are merged.
+    Returns:
+        (Pi0_merged [D_eff, C], nu, D_eff).
+    """
+    D = Pi0.shape[0]
+    keep = list(range(D))
+    merged = True
+    while merged:
+        merged = False
+        for a_i in range(len(keep)):
+            for b_i in range(a_i + 1, len(keep)):
+                da, db = keep[a_i], keep[b_i]
+                if torch.norm(Pi0[da] - Pi0[db]).item() < merge_tol:
+                    Pi0[da] = project_rows_to_simplex(
+                        ((Pi0[da] + Pi0[db]) * 0.5).unsqueeze(0)).squeeze(0)
+                    keep.pop(b_i)
+                    merged = True
+                    break
+            if merged:
+                break
+    Pi0 = Pi0[keep]
+    D_eff = Pi0.shape[0]
+    if D_eff >= 2:
+        dmat = torch.cdist(Pi0, Pi0) + torch.eye(D_eff) * 1e9
+        nu = float(dmat.min().item())
+    else:
+        nu = float('inf')
+    return Pi0, nu, D_eff
 
 
 def compute_coactivation_matrix_percell(
@@ -132,8 +189,8 @@ def compute_coactivation_matrix_percell(
 
 def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
                          nmf_iters: int = 4000, merge_tol: float = 1e-2,
-                         seed: int = 0, subsample_cells: int = 200000
-                         ) -> Tuple[torch.Tensor, float, int]:
+                         seed: int = 0, subsample_cells: int = 200000,
+                         device: str = "cpu", return_trace: bool = False):
     """Build the DCAM anchor Pi0 from the PER-CELL covariance.
 
     Drop-in replacement for the
@@ -141,19 +198,33 @@ def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
         Pi0, nu, D_eff = build_anchor(S, D, ...)
     pair in run_dcam_full.main().
 
-    Note on nmf_iters: the diagnostic showed build_anchor's default 500 was
-    undertrained (error still descending). 4000 is the safe default here.
-    build_anchor itself is called unchanged -- only the S it factorizes is
-    corrected.
+    Solver: this uses check_anchor_nonnegativity.nmf_symmetric, NOT
+    build_anchor's NMF. nmf_symmetric (a) rescales the random init so
+    W W^T starts at S's magnitude and (b) correlation-normalizes S before
+    factorizing. build_anchor's NMF does neither, which is why it stalled at
+    rel_err ~285 on the large-magnitude per-cell S -- that 285 was an
+    unconverged factorization, not a converged-but-bad one.
 
-    Returns the same triple as build_anchor: (Pi0, nu, D_eff).
+    Args:
+        activation_chunks: cached A's.
+        D: requested atom count.
+        nmf_iters: NMF iterations (nmf_symmetric also early-stops on plateau).
+        merge_tol: non-degeneracy merge tolerance.
+        seed: NMF seed.
+        subsample_cells: cells kept per chunk when building S_cell.
+        device: 'cuda' or 'cpu' for the NMF math.
+        return_trace: if True, also return the NMF convergence trace so the
+            caller can verify the factorization actually converged before
+            trusting the anchor.
+    Returns:
+        (Pi0, nu, D_eff)  or  (Pi0, nu, D_eff, trace, nmf_err) if return_trace.
     """
     print(f"\n[build_anchor_percell] building per-cell covariance "
           f"(subsample_cells={subsample_cells})")
     S_cell = compute_coactivation_matrix_percell(
         activation_chunks, subsample_cells=subsample_cells, seed=seed)
 
-    # Report the effective rank so the log makes the fix's rationale visible.
+    # Report effective rank so the log makes the fix's rationale visible.
     with torch.no_grad():
         ev = torch.linalg.eigvalsh(S_cell.double())
         ev = ev[ev > 0]
@@ -161,8 +232,39 @@ def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
     print(f"[build_anchor_percell] per-cell S participation ratio = "
           f"{pr:.1f}  (averaged-S was ~1.6; higher = more structure kept)")
 
-    print(f"[build_anchor_percell] running symmetric NMF "
-          f"(D={D}, nmf_iters={nmf_iters})")
-    Pi0, nu, D_eff = build_anchor(
-        S_cell, D, nmf_iters=nmf_iters, merge_tol=merge_tol, seed=seed)
+    # --- symmetric NMF with the CONVERGING solver -----------------------
+    print(f"[build_anchor_percell] running symmetric NMF via nmf_symmetric "
+          f"(D={D}, iters={nmf_iters}, normalize=correlation, "
+          f"rescaled init, device={device})")
+    W, nmf_err, trace = nmf_symmetric(
+        S_cell.numpy(), D, iters=nmf_iters, restarts=1,
+        normalize=True, seed=seed, verbose=True, device=device)
+
+    # Convergence sanity check: nmf_err is rel_err vs the ORIGINAL S, in
+    # [0, ~1] for a converged fit. build_anchor's stalled NMF reported ~285.
+    print(f"[build_anchor_percell] NMF final rel_err = {nmf_err:.4f}")
+    if nmf_err > 1.0:
+        print(f"  [WARNING] rel_err {nmf_err:.2f} > 1.0 -- the NMF has NOT "
+              f"converged. The anchor (and any stability verdict computed "
+              f"from it) is NOT trustworthy. Raise --nmf_iters, or inspect "
+              f"the convergence trace.")
+    elif trace and len(trace) >= 2 and abs(trace[-1][1] - trace[-2][1]) > 1e-3:
+        print(f"  [NOTE] NMF still descending at the last checkpoint "
+              f"({trace[-2][1]:.4f} -> {trace[-1][1]:.4f}); consider more "
+              f"iterations for a fully settled anchor.")
+
+    # --- atoms = columns of W, L1-normalized as simplex rows ------------
+    Pi0 = torch.as_tensor(W, dtype=torch.float32).t().clone()   # [D, C]
+    Pi0 = project_rows_to_simplex(Pi0)
+
+    # --- non-degeneracy merge ------------------------------------------
+    Pi0, nu, D_eff = _merge_near_duplicate_atoms(Pi0, merge_tol)
+    print(f"[build_anchor_percell] requested D={D}, after merge D_eff={D_eff}, "
+          f"non-degeneracy nu={nu:.4e}")
+    if D_eff < D:
+        print(f"  [anchor] {D - D_eff} near-duplicate atom(s) merged "
+              f"(merge_tol={merge_tol}).")
+
+    if return_trace:
+        return Pi0, nu, D_eff, trace, nmf_err
     return Pi0, nu, D_eff
