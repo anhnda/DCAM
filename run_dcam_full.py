@@ -55,6 +55,8 @@ Usage:
 """
 
 import torch
+
+from patch_dcam_percell_anchor import build_dcam_anchor_percell
 torch.cuda.init()
 
 import torch.nn as nn
@@ -919,10 +921,13 @@ def main():
 
     # ---- anchor Pi0  (seed-free) ---------------------------------------
     print(f"\n{'='*80}\nBuilding seed-free anchor Pi0\n{'='*80}")
-    S = compute_coactivation_matrix(act_chunks)
-    Pi0, nu, D_eff = build_anchor(
-        S, D, nmf_iters=args.nmf_iters, merge_tol=args.merge_tol,
-        seed=args.anchor_seed)
+    from patch_dcam_percell_anchor import build_dcam_anchor_percell
+    Pi0, nu, D_eff = build_dcam_anchor_percell(
+        act_chunks, D,
+        nmf_iters=max(args.nmf_iters, 8000),
+        merge_tol=args.merge_tol,
+        device=str(device),
+        subsample_cells=200000)
     Pi0 = Pi0.to(device)
     if D_eff != D:
         print(f"  NOTE: D reduced {D} -> {D_eff} after non-degeneracy merge.")
