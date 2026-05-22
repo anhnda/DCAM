@@ -1,6 +1,6 @@
 """
-csae_ica_anchor.py
-==================
+csae_ica_anchor.py  (GPU-accelerated)
+=====================================
 Build a seed-free, SIGNED anchor for CSAE's encoder from the per-cell
 activation statistics, via SVD-whitening + ICA.
 
@@ -18,33 +18,41 @@ whitened SVD subspace toward statistical independence, which tends to align
 with distinct generative factors -- a better "concept" target. Standard ICA
 IS svd-whiten -> independence-rotation, so this module does both.
 
+GPU acceleration
+----------------
+The heavy linear algebra now runs on GPU (torch.cuda) when available:
+  * per-cell covariance accumulation (X^T X) per chunk,
+  * eigh-based SVD whitening (C x C),
+  * FastICA fixed-point loop (the hot path -- g @ X_white every iter),
+  * batched whitening of the ICA sample set.
+Cache I/O (joblib) stays on CPU; each chunk is moved to GPU once and freed.
+Everything still runs in float64 by default for numerical parity with the
+old CPU path; pass --dtype float32 for a large extra speedup on consumer GPUs.
+
 Determinism
 -----------
 The whole pipeline is run with a FIXED seed, so the anchor is seed-free by
 construction. We VERIFY this by building it at several seeds and checking the
-components match (Hungarian-matched, sign/permutation aware) -- the same
-discipline that exposed the NMF convergence bug earlier. ICA has an inherent
-sign+permutation ambiguity; verification accounts for it.
+components match (Hungarian-matched, sign/permutation aware). ICA has an
+inherent sign+permutation ambiguity; verification accounts for it.
+
+NOTE on GPU determinism: torch CUDA reductions/SVD are not always bitwise
+reproducible, but the cross-seed determinism check tolerates that (it
+measures component agreement up to sign+perm, well above floating-point
+noise). For an exact-reproducible saved anchor, build the final seed-0
+anchor on CPU (--device cpu) or accept the (tiny) CUDA nondeterminism.
 
 What this module produces
 -------------------------
 build_ica_anchor() -> W0  in  R^{D x C}
-  D signed unit-norm rows over the C backbone channels. This is the anchor
-  target for CSAE's encoder weights (a 1x1 conv weight is [hidden, C, 1, 1];
-  the [hidden, C] slice is what gets anchored).
-
-Memory
-------
-The per-cell covariance is C x C and is streamed one cache chunk at a time;
-activations are never fully loaded. ICA runs on the C x C scale, never on the
-full activation set.
+  D signed unit-norm rows over the C backbone channels.
 
 Usage (standalone verification -- DO THIS BEFORE training CSAE)
 ---------------------------------------------------------------
     python csae_ica_anchor.py \\
         --cache_dir cache_activations \\
         --cache_key resnet50_layer3_thresh0p85_samples50000_chunk100_gcmap1 \\
-        --D 200 --verify_seeds 0 1 2
+        --D 200 --verify_seeds 0 1 2 --device cuda
 """
 
 import argparse
@@ -62,22 +70,64 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------
-# Per-cell covariance (streamed)
+# Device / dtype helpers
 # ----------------------------------------------------------------------
+
+def resolve_device(device: str):
+    """Resolve 'auto'/'cuda'/'cpu' to a torch.device, with a CPU fallback."""
+    if torch is None:
+        return None
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[ica anchor] CUDA requested but not available; using CPU.")
+        device = "cpu"
+    return torch.device(device)
+
+
+def torch_dtype(dtype: str):
+    return torch.float64 if dtype == "float64" else torch.float32
+
 
 def _to_numpy(x):
     if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy().astype(np.float64)
-    return np.asarray(x, dtype=np.float64)
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
-def build_percell_covariance(cache_path: Path, max_chunks=None,
-                             subsample_cells=200000, seed=0):
+def _chunk_to_cells(part, C_hint=None):
+    """Turn a cached chunk into a [n_cells, C] float array (still on CPU).
+
+    Kept in the cache's native dtype to avoid an extra float64 upcast on CPU;
+    the upcast happens once on the GPU side.
+    """
+    act = part["activation"]
+    if torch is not None and isinstance(act, torch.Tensor):
+        act = act.detach().cpu().numpy()
+    else:
+        act = np.asarray(act)
+    if act.ndim == 4:
+        n, C, H, W = act.shape
+        cells = act.transpose(0, 2, 3, 1).reshape(-1, C)
+    elif act.ndim == 2:
+        cells = act
+    else:
+        raise ValueError(f"unexpected ndim {act.ndim}")
+    return cells
+
+
+# ----------------------------------------------------------------------
+# Per-cell covariance (streamed, GPU-accumulated)
+# ----------------------------------------------------------------------
+
+def build_percell_covariance(cache_path: Path, device, dtype,
+                             max_chunks=None, subsample_cells=200000, seed=0):
     """Per-cell channel covariance + mean, streamed one chunk at a time.
 
-    Returns (mean [C], cov [C, C]) over all spatial cells. ICA needs the
-    mean to center and the covariance to whiten. Memory: one chunk resident
-    at a time.
+    The X^T X accumulation runs on `device`. Each chunk is moved to the GPU
+    once, reduced, and freed -- activations are never all resident at once.
+
+    Returns (mean [C], cov [C, C]) as float64 numpy arrays.
     """
     parts = sorted(cache_path.glob("part_*.pkl"))
     if not parts:
@@ -87,167 +137,182 @@ def build_percell_covariance(cache_path: Path, max_chunks=None,
     rng = np.random.default_rng(seed)
 
     n_cells = 0
-    sum_x = None        # [C]
-    sum_xxT = None      # [C, C]
-    print(f"Streaming {len(parts)} chunk(s) for per-cell covariance...")
+    sum_x = None        # [C] on device
+    sum_xxT = None      # [C, C] on device
+    print(f"Streaming {len(parts)} chunk(s) for per-cell covariance "
+          f"on {device} ({dtype})...")
     for i, p in enumerate(parts):
         part = joblib.load(p)
-        act = _to_numpy(part["activation"])             # [n, C, H, W]
-        if act.ndim == 4:
-            n, C, H, W = act.shape
-            cells = act.transpose(0, 2, 3, 1).reshape(-1, C)
-        elif act.ndim == 2:
-            cells = act
-        else:
-            raise ValueError(f"unexpected ndim {act.ndim}")
+        cells = _chunk_to_cells(part)                   # [n, C] cpu
         if subsample_cells and cells.shape[0] > subsample_cells:
             keep = rng.choice(cells.shape[0], subsample_cells, replace=False)
             cells = cells[keep]
+        xt = torch.as_tensor(np.ascontiguousarray(cells)).to(device=device,
+                                                             dtype=dtype)
         if sum_x is None:
-            C = cells.shape[1]
-            sum_x = np.zeros(C, dtype=np.float64)
-            sum_xxT = np.zeros((C, C), dtype=np.float64)
-        sum_x += cells.sum(axis=0)
-        sum_xxT += cells.T @ cells
-        n_cells += cells.shape[0]
-        del part, act, cells
+            C = xt.shape[1]
+            sum_x = torch.zeros(C, device=device, dtype=dtype)
+            sum_xxT = torch.zeros((C, C), device=device, dtype=dtype)
+        sum_x += xt.sum(dim=0)
+        sum_xxT += xt.T @ xt
+        n_cells += xt.shape[0]
+        del part, cells, xt
         if (i + 1) % 20 == 0 or (i + 1) == len(parts):
             print(f"  ...{i+1}/{len(parts)} chunks, {n_cells} cells")
 
-    mean = sum_x / max(n_cells, 1)
-    cov = sum_xxT / max(n_cells, 1) - np.outer(mean, mean)
-    cov = 0.5 * (cov + cov.T)
+    inv_n = 1.0 / max(n_cells, 1)
+    mean_t = sum_x * inv_n
+    cov_t = sum_xxT * inv_n - torch.outer(mean_t, mean_t)
+    cov_t = 0.5 * (cov_t + cov_t.T)
+    mean = mean_t.double().cpu().numpy()
+    cov = cov_t.double().cpu().numpy()
     print(f"Per-cell covariance built: C={cov.shape[0]}, {n_cells} cells.")
     return mean, cov
 
 
 # ----------------------------------------------------------------------
-# SVD-whitening + FastICA
+# SVD-whitening + FastICA (GPU)
 # ----------------------------------------------------------------------
 
-def svd_whiten(cov, D):
-    """Top-D PCA whitening transform from the covariance.
+def svd_whiten(cov, D, device, dtype):
+    """Top-D PCA whitening transform from the covariance, via torch.eigh.
 
     Returns:
-        V  [C, D]   top-D eigenvectors (signed, orthonormal)
-        whiten [D, C]  the whitening map  diag(1/sqrt(lambda)) V^T
-        eigvals [D]    the kept eigenvalues
+        Vk  [C, D]      top-D eigenvectors (signed, orthonormal), numpy f64
+        whiten [D, C]   the whitening map diag(1/sqrt(lambda)) V^T, numpy f64
+        eigvals [D]     the kept eigenvalues, numpy f64
     """
-    w, V = np.linalg.eigh(cov)              # ascending
-    order = np.argsort(w)[::-1]
-    keep = order[:D]
-    eigvals = np.clip(w[keep], 1e-12, None)
-    Vk = V[:, keep]                         # [C, D]
-    whiten = (Vk / np.sqrt(eigvals)).T      # [D, C]
-    return Vk, whiten, eigvals
+    cov_t = torch.as_tensor(cov, device=device, dtype=dtype)
+    cov_t = 0.5 * (cov_t + cov_t.T)
+    w, V = torch.linalg.eigh(cov_t)             # ascending
+    w = w.flip(0)
+    V = V.flip(1)
+    keep = slice(0, D)
+    eigvals = w[keep].clamp_min(1e-12)
+    Vk = V[:, keep]                             # [C, D]
+    whiten = (Vk / torch.sqrt(eigvals)).T       # [D, C]
+    return (Vk.double().cpu().numpy(),
+            whiten.double().cpu().numpy(),
+            eigvals.double().cpu().numpy())
 
 
-def fastica(X_white, n_components, seed=0, max_iter=500, tol=1e-5):
-    """Symmetric (parallel) FastICA with the logcosh nonlinearity.
+def fastica(X_white, n_components, device, dtype, seed=0,
+            max_iter=500, tol=1e-5):
+    """Symmetric (parallel) FastICA with logcosh nonlinearity, on GPU.
 
     Args:
-        X_white: [N, D] whitened, zero-mean samples (rows = samples).
+        X_white: [N, D] whitened, zero-mean samples (numpy or tensor).
         n_components: number of independent components (<= D).
-        seed: FIXED rng seed for the W init -- determinism comes from here.
+        seed: FIXED seed for the W init -- determinism comes from here.
     Returns:
-        W_ica [n_components, D]  unmixing matrix (rows = components in the
-        whitened space). Each row is unit-norm.
+        W_ica [n_components, D] numpy f64 unmixing matrix (rows = components
+        in the whitened space). Each row is unit-norm.
     """
-    rng = np.random.default_rng(seed)
-    N, D = X_white.shape
+    Xw = torch.as_tensor(np.asarray(X_white)) if not isinstance(
+        X_white, torch.Tensor) else X_white
+    Xw = Xw.to(device=device, dtype=dtype)
+    N, D = Xw.shape
     n = min(n_components, D)
 
-    # deterministic orthonormal init
-    W = rng.standard_normal((n, D))
-    # symmetric orthonormalization:  W <- (W W^T)^-1/2 W
-    def sym_orth(M):
-        u, s, vt = np.linalg.svd(M, full_matrices=False)
-        return u @ vt
-    W = sym_orth(W)
+    # deterministic init: seed a CPU generator (portable across devices),
+    # build W there, then move it -- keeps the init seed-reproducible
+    # regardless of CUDA RNG quirks.
+    g_cpu = torch.Generator(device="cpu").manual_seed(int(seed))
+    W = torch.randn(n, D, generator=g_cpu, dtype=torch.float64)
+    W = W.to(device=device, dtype=dtype)
 
+    def sym_orth(M):
+        # W <- (W W^T)^-1/2 W   via SVD
+        u, s, vt = torch.linalg.svd(M, full_matrices=False)
+        return u @ vt
+
+    W = sym_orth(W)
+    XwT = Xw.T.contiguous()                     # [D, N], reused every iter
     for it in range(max_iter):
-        WX = W @ X_white.T                  # [n, N]
-        g = np.tanh(WX)                     # logcosh derivative
-        g_prime = 1.0 - g ** 2              # [n, N]
-        # FastICA fixed-point update
-        W_new = (g @ X_white) / N - (g_prime.mean(axis=1)[:, None] * W)
+        WX = W @ XwT                            # [n, N]
+        g = torch.tanh(WX)                      # logcosh derivative
+        g_prime = 1.0 - g * g                   # [n, N]
+        W_new = (g @ Xw) / N - g_prime.mean(dim=1, keepdim=True) * W
         W_new = sym_orth(W_new)
-        # convergence: max abs change in component directions (sign-agnostic)
-        diff = np.max(np.abs(np.abs((W_new * W).sum(axis=1)) - 1.0))
+        # convergence: max |1 - |<w_new, w_old>|| (sign-agnostic)
+        dots = (W_new * W).sum(dim=1).abs()
+        diff = (dots - 1.0).abs().max().item()
         W = W_new
         if diff < tol:
             break
-    return W
+    return W.double().cpu().numpy()
 
 
 def build_ica_anchor(cache_path: Path, D=200, seed=0, max_chunks=None,
                      subsample_cells=200000, ica_sample_cells=100000,
-                     return_diagnostics=False):
-    """Build the signed ICA anchor W0 in R^{D x C}.
+                     device="auto", dtype="float64",
+                     return_diagnostics=False, _reuse_cov=None):
+    """Build the signed ICA anchor W0 in R^{D x C} (GPU-accelerated).
 
     Pipeline: per-cell covariance -> top-D SVD whitening -> FastICA in the
     whitened space -> map components back to the C-channel space -> unit-
     normalize each row.
 
     Args:
-        D: number of anchor atoms. Set to the per-cell effective rank
-           (~200 for ResNet50 layer3) -- NOT an arbitrary number.
-        seed: FIXED seed (whitening is deterministic; this seeds the ICA
-              init). Determinism of the anchor depends on keeping it fixed.
-        ica_sample_cells: how many whitened cells to feed FastICA. ICA needs
-              samples, not just the covariance; we re-stream a subsample.
+        D: number of anchor atoms (~200 for ResNet50 layer3).
+        seed: FIXED seed (whitening is deterministic; this seeds ICA init).
+        device: 'auto' | 'cuda' | 'cpu'.
+        dtype: 'float64' (parity with CPU path) | 'float32' (faster on GPU).
+        _reuse_cov: optional (mean, cov) tuple to skip the covariance pass
+            (used by the verifier to stream the cache only once).
     Returns:
         W0 [D, C] signed, unit-norm rows. (Plus a diagnostics dict if asked.)
     """
-    mean, cov = build_percell_covariance(
-        cache_path, max_chunks=max_chunks, subsample_cells=subsample_cells,
-        seed=seed)
+    dev = resolve_device(device)
+    dt = torch_dtype(dtype)
+
+    if _reuse_cov is not None:
+        mean, cov = _reuse_cov
+    else:
+        mean, cov = build_percell_covariance(
+            cache_path, dev, dt, max_chunks=max_chunks,
+            subsample_cells=subsample_cells, seed=seed)
     C = cov.shape[0]
     D = min(D, C)
 
-    Vk, whiten, eigvals = svd_whiten(cov, D)
+    Vk, whiten, eigvals = svd_whiten(cov, D, dev, dt)
     print(f"[ica anchor] SVD whitening: kept D={D}, "
           f"eigval range [{eigvals.min():.4e}, {eigvals.max():.4e}]")
 
-    # collect a whitened sample set for ICA (re-stream a subsample of cells)
+    # collect a whitened sample set for ICA (re-stream a subsample of cells);
+    # the per-chunk whitening (cells - mean) @ whiten.T runs on GPU.
     parts = sorted(cache_path.glob("part_*.pkl"))
     if max_chunks is not None:
         parts = parts[:max_chunks]
     rng = np.random.default_rng(seed)
     want_per_chunk = max(1, ica_sample_cells // len(parts))
+    mean_t = torch.as_tensor(mean, device=dev, dtype=dt)
+    whiten_t = torch.as_tensor(whiten, device=dev, dtype=dt)   # [D, C]
     whitened = []
     for p in parts:
         part = joblib.load(p)
-        act = _to_numpy(part["activation"])
-        if act.ndim == 4:
-            n, _, H, W = act.shape
-            cells = act.transpose(0, 2, 3, 1).reshape(-1, C)
-        else:
-            cells = act
+        cells = _chunk_to_cells(part)
         if cells.shape[0] > want_per_chunk:
             keep = rng.choice(cells.shape[0], want_per_chunk, replace=False)
             cells = cells[keep]
-        # center then whiten:  x_white = whiten @ (x - mean)
-        xw = (cells - mean) @ whiten.T          # [n', D]
-        whitened.append(xw)
-        del part, act, cells
-    X_white = np.concatenate(whitened, axis=0)
+        xt = torch.as_tensor(np.ascontiguousarray(cells)).to(
+            device=dev, dtype=dt)
+        xw = (xt - mean_t) @ whiten_t.T              # [n', D]
+        whitened.append(xw.cpu())
+        del part, cells, xt, xw
+    X_white = torch.cat(whitened, dim=0)             # cpu tensor
     print(f"[ica anchor] FastICA on {X_white.shape[0]} whitened cells "
-          f"(D={D})")
+          f"(D={D}) on {dev}")
 
-    W_ica = fastica(X_white, D, seed=seed)      # [D, D] in whitened space
+    W_ica = fastica(X_white, D, dev, dt, seed=seed)  # [D, D] numpy f64
 
-    # map ICA components back to the C-channel space:
-    #   a whitened-space component  w  corresponds to channel-space
-    #   direction  w @ whiten  (since x_white = whiten @ x_centered).
-    W0 = W_ica @ whiten                         # [D, C]
-    # unit-normalize each row
+    # map ICA components back to channel space: w @ whiten
+    W0 = W_ica @ whiten                              # [D, C]
     norms = np.linalg.norm(W0, axis=1, keepdims=True)
     norms[norms < 1e-12] = 1.0
     W0 = W0 / norms
 
-    # fix sign ambiguity deterministically: make the largest-magnitude
-    # entry of each row positive (a fixed, seed-independent convention)
+    # deterministic sign fix: largest-magnitude entry of each row positive
     for d in range(W0.shape[0]):
         j = np.argmax(np.abs(W0[d]))
         if W0[d, j] < 0:
@@ -257,7 +322,8 @@ def build_ica_anchor(cache_path: Path, D=200, seed=0, max_chunks=None,
 
     if return_diagnostics:
         diag = {'eigvals': eigvals, 'mean': mean,
-                'n_cells_cov': subsample_cells}
+                'n_cells_cov': subsample_cells, 'device': str(dev),
+                'dtype': dtype}
         return W0, diag
     return W0
 
@@ -284,20 +350,27 @@ def matched_component_distance(A, B):
     return float(cost[r, c].mean())
 
 
-def verify_anchor_determinism(cache_path, D, seeds, **kw):
+def verify_anchor_determinism(cache_path, D, seeds, device="auto",
+                              dtype="float64", **kw):
     """Build the ICA anchor at several seeds and report cross-seed agreement.
 
-    ICA's fixed-point iteration is seeded; if the anchor is to be a
-    deterministic, reportable object the cross-seed distance must be ~0.
-    A non-zero value means ICA is finding different independent bases on
-    different seeds -- in which case the anchor must fix ONE seed and the
-    paper must say so explicitly (as with the NNDSVD anchor).
+    The per-cell covariance does NOT depend on the ICA seed (only on the
+    covariance-subsample rng), so it is built ONCE and reused across seeds --
+    this halves the cache streaming compared to the old per-seed rebuild.
     """
     print(f"\n{'='*60}\nANCHOR DETERMINISM CHECK (seeds={seeds})\n{'='*60}")
+    dev = resolve_device(device)
+    dt = torch_dtype(dtype)
+    # build covariance once (seed only affects the subsample draw; fix it)
+    cov_seed = seeds[0]
+    mean, cov = build_percell_covariance(
+        cache_path, dev, dt, max_chunks=kw.get("max_chunks"),
+        subsample_cells=kw.get("subsample_cells", 200000), seed=cov_seed)
     anchors = []
     for sd in seeds:
         print(f"\n--- seed {sd} ---")
-        W0 = build_ica_anchor(cache_path, D=D, seed=sd, **kw)
+        W0 = build_ica_anchor(cache_path, D=D, seed=sd, device=device,
+                              dtype=dtype, _reuse_cov=(mean, cov), **kw)
         anchors.append(W0)
     dists = []
     for i in range(len(anchors)):
@@ -321,18 +394,23 @@ def verify_anchor_determinism(cache_path, D, seeds, **kw):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build / verify the signed ICA anchor for CSAE.")
+        description="Build / verify the signed ICA anchor for CSAE (GPU).")
     ap.add_argument("--cache_dir", type=str, default="cache_activations")
     ap.add_argument("--cache_key", type=str, required=True,
                     help="CSAE activation cache dir (the gcmap1 one).")
     ap.add_argument("--D", type=int, default=200,
-                    help="Anchor atom count. Set to the per-cell effective "
-                         "rank (~200 for ResNet50 layer3).")
+                    help="Anchor atom count (~200 for ResNet50 layer3).")
     ap.add_argument("--verify_seeds", type=int, nargs="+", default=[0, 1, 2],
                     help="Seeds for the determinism check.")
     ap.add_argument("--max_chunks", type=int, default=None)
     ap.add_argument("--subsample_cells", type=int, default=200000)
     ap.add_argument("--ica_sample_cells", type=int, default=100000)
+    ap.add_argument("--device", type=str, default="auto",
+                    choices=["auto", "cuda", "cpu"],
+                    help="Where to run the linear algebra.")
+    ap.add_argument("--dtype", type=str, default="float64",
+                    choices=["float64", "float32"],
+                    help="float64 = CPU-parity; float32 = faster on GPU.")
     ap.add_argument("--save", type=str, default="csae_ica_anchor_W0.npy",
                     help="Where to save the seed-0 anchor.")
     args = ap.parse_args()
@@ -344,9 +422,10 @@ def main():
     if not cache_path.exists():
         raise SystemExit(f"Cache not found: {cache_path}")
 
-    # 1. verify determinism across seeds
+    # 1. verify determinism across seeds (covariance built once, reused)
     mean_d, anchors = verify_anchor_determinism(
         cache_path, args.D, args.verify_seeds,
+        device=args.device, dtype=args.dtype,
         max_chunks=args.max_chunks, subsample_cells=args.subsample_cells,
         ica_sample_cells=args.ica_sample_cells)
 
