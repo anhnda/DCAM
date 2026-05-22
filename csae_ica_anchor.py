@@ -197,49 +197,37 @@ def svd_whiten(cov, D, device, dtype):
 
 
 def fastica(X_white, n_components, device, dtype, seed=0,
-            max_iter=500, tol=1e-5):
-    """Symmetric (parallel) FastICA with logcosh nonlinearity, on GPU.
-
-    Args:
-        X_white: [N, D] whitened, zero-mean samples (numpy or tensor).
-        n_components: number of independent components (<= D).
-        seed: FIXED seed for the W init -- determinism comes from here.
-    Returns:
-        W_ica [n_components, D] numpy f64 unmixing matrix (rows = components
-        in the whitened space). Each row is unit-norm.
-    """
+            max_iter=500, tol=1e-5, verbose=True):
     Xw = torch.as_tensor(np.asarray(X_white)) if not isinstance(
         X_white, torch.Tensor) else X_white
     Xw = Xw.to(device=device, dtype=dtype)
     N, D = Xw.shape
     n = min(n_components, D)
-
-    # deterministic init: seed a CPU generator (portable across devices),
-    # build W there, then move it -- keeps the init seed-reproducible
-    # regardless of CUDA RNG quirks.
     g_cpu = torch.Generator(device="cpu").manual_seed(int(seed))
-    W = torch.randn(n, D, generator=g_cpu, dtype=torch.float64)
-    W = W.to(device=device, dtype=dtype)
+    W = torch.randn(n, D, generator=g_cpu, dtype=torch.float64).to(device=device, dtype=dtype)
 
     def sym_orth(M):
-        # W <- (W W^T)^-1/2 W   via SVD
         u, s, vt = torch.linalg.svd(M, full_matrices=False)
         return u @ vt
 
     W = sym_orth(W)
-    XwT = Xw.T.contiguous()                     # [D, N], reused every iter
+    XwT = Xw.T.contiguous()
+    converged, last_diff = False, float('nan')
     for it in range(max_iter):
-        WX = W @ XwT                            # [n, N]
-        g = torch.tanh(WX)                      # logcosh derivative
-        g_prime = 1.0 - g * g                   # [n, N]
+        WX = W @ XwT
+        g = torch.tanh(WX)
+        g_prime = 1.0 - g * g
         W_new = (g @ Xw) / N - g_prime.mean(dim=1, keepdim=True) * W
         W_new = sym_orth(W_new)
-        # convergence: max |1 - |<w_new, w_old>|| (sign-agnostic)
-        dots = (W_new * W).sum(dim=1).abs()
-        diff = (dots - 1.0).abs().max().item()
+        last_diff = (((W_new * W).sum(dim=1).abs()) - 1.0).abs().max().item()
         W = W_new
-        if diff < tol:
+        if last_diff < tol:
+            converged = True
             break
+    if verbose:
+        status = "converged" if converged else f"HIT max_iter={max_iter}"
+        print(f"[fastica] seed={seed}: {status} at it={it+1}, "
+              f"final diff={last_diff:.2e}")
     return W.double().cpu().numpy()
 
 
