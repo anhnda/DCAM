@@ -190,7 +190,8 @@ def compute_coactivation_matrix_percell(
 def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
                          nmf_iters: int = 4000, merge_tol: float = 1e-2,
                          seed: int = 0, subsample_cells: int = 200000,
-                         device: str = "cpu", return_trace: bool = False):
+                         device: str = "cpu", return_trace: bool = False,
+                         init: str = "random"):
     """Build the DCAM anchor Pi0 from the PER-CELL covariance.
 
     Drop-in replacement for the
@@ -202,22 +203,18 @@ def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
     build_anchor's NMF. nmf_symmetric (a) rescales the random init so
     W W^T starts at S's magnitude and (b) correlation-normalizes S before
     factorizing. build_anchor's NMF does neither, which is why it stalled at
-    rel_err ~285 on the large-magnitude per-cell S -- that 285 was an
-    unconverged factorization, not a converged-but-bad one.
+    rel_err ~285 on the large-magnitude per-cell S.
 
     Args:
-        activation_chunks: cached A's.
-        D: requested atom count.
-        nmf_iters: NMF iterations (nmf_symmetric also early-stops on plateau).
-        merge_tol: non-degeneracy merge tolerance.
-        seed: NMF seed.
-        subsample_cells: cells kept per chunk when building S_cell.
-        device: 'cuda' or 'cpu' for the NMF math.
-        return_trace: if True, also return the NMF convergence trace so the
-            caller can verify the factorization actually converged before
-            trusting the anchor.
+        init: 'random' -- seed-dependent NMF init (default).
+              'nndsvd' -- deterministic SVD-based init; the anchor is then
+                          seed-FREE by construction. Use this if the
+                          random-init per-cell anchor is seed-sensitive and
+                          you want to test whether a deterministic init
+                          recovers reproducibility.
+        return_trace: if True, also return (trace, nmf_err).
     Returns:
-        (Pi0, nu, D_eff)  or  (Pi0, nu, D_eff, trace, nmf_err) if return_trace.
+        (Pi0, nu, D_eff)  or  (Pi0, nu, D_eff, trace, nmf_err).
     """
     print(f"\n[build_anchor_percell] building per-cell covariance "
           f"(subsample_cells={subsample_cells})")
@@ -234,11 +231,11 @@ def build_anchor_percell(activation_chunks: List[torch.Tensor], D: int,
 
     # --- symmetric NMF with the CONVERGING solver -----------------------
     print(f"[build_anchor_percell] running symmetric NMF via nmf_symmetric "
-          f"(D={D}, iters={nmf_iters}, normalize=correlation, "
-          f"rescaled init, device={device})")
+          f"(D={D}, iters={nmf_iters}, init={init}, "
+          f"normalize=correlation, device={device})")
     W, nmf_err, trace = nmf_symmetric(
         S_cell.numpy(), D, iters=nmf_iters, restarts=1,
-        normalize=True, seed=seed, verbose=True, device=device)
+        normalize=True, seed=seed, verbose=True, device=device, init=init)
 
     # Convergence sanity check: nmf_err is rel_err vs the ORIGINAL S, in
     # [0, ~1] for a converged fit. build_anchor's stalled NMF reported ~285.

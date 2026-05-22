@@ -360,8 +360,63 @@ def signed_GGt_psd(S, D, device="cpu"):
     return S_hat.cpu().numpy(), e, int(g.shape[1])
 
 
+def nndsvd_init_symmetric(S_work, D, device="cpu"):
+    """Deterministic NNDSVD init for symmetric NMF  S ~ W W^T.
+
+    NNDSVD (Boutsidis & Gallopoulos, 2008) seeds NMF from the truncated SVD,
+    so the init is FULLY DETERMINISTIC -- no seed. For a symmetric PSD S we
+    use the eigendecomposition (eigenvectors = singular vectors, eigenvalues
+    >= 0 = singular values).
+
+    For each of the top-D eigenpairs (lambda_j, v_j), v_j has mixed sign but
+    sqrt(lambda_j) v_j is a valid signed factor column. NNDSVD turns it into
+    a non-negative column by taking whichever of the positive part v_j+ or
+    the negative part v_j- carries more energy, scaled by sqrt(lambda_j) and
+    the relevant norm. This gives W >= 0 with W W^T already close to the
+    leading structure of S.
+
+    Why this matters here: the random-init NMF gave cross-seed atom distance
+    ~0.12 flat in D. If that is just different random basins, a deterministic
+    NNDSVD init should give cross-seed distance ~0 (identical start ->
+    identical descent). If NNDSVD-init NMF is STILL seed-varying, something
+    is non-deterministic in the solver itself; if it is stable, the anchor
+    can be made deterministic via this init.
+
+    Returns W [C, D] non-negative float64 tensor on `device`.
+    """
+    St = _as_tensor(S_work, device)
+    w, V = torch.linalg.eigh(St)                    # ascending
+    order = torch.argsort(w, descending=True)
+    keep = order[:min(D, w.shape[0])]
+    w = torch.clamp(w[keep], min=0.0)               # PSD: tiny negs -> 0
+    V = V[:, keep]                                  # [C, D']
+
+    C = St.shape[0]
+    Dk = V.shape[1]
+    W = torch.zeros((C, Dk), dtype=torch.float64, device=device)
+    for j in range(Dk):
+        v = V[:, j]
+        s = torch.sqrt(w[j])
+        vp = torch.clamp(v, min=0.0)
+        vn = torch.clamp(-v, min=0.0)
+        np_ = torch.linalg.norm(vp)
+        nn_ = torch.linalg.norm(vn)
+        if np_ >= nn_:
+            col = vp / (np_ + 1e-12)
+        else:
+            col = vn / (nn_ + 1e-12)
+        W[:, j] = s * col
+    # pad with tiny positive values if D > rank kept
+    if Dk < D:
+        pad = torch.full((C, D - Dk), 1e-4, dtype=torch.float64,
+                         device=device)
+        W = torch.cat([W, pad], dim=1)
+    W = torch.clamp(W, min=1e-9)
+    return W
+
+
 def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
-                  tol=1e-7, verbose=True, device="cpu"):
+                  tol=1e-7, verbose=True, device="cpu", init="random"):
     """Symmetric NMF  S ~ W W^T,  W >= 0,  via multiplicative updates.
 
     GPU-accelerated: every per-iteration op (the [C,D] matmuls SW, W W^T W)
@@ -371,6 +426,17 @@ def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
     A stronger version of build_anchor's NMF: more iters, optional S
     normalization to a correlation matrix, multiple random restarts, and a
     real convergence trace (build_anchor logs only the final iter).
+
+    Args:
+        init: 'random'  -- W = rescaled rand(C,D), seeded by `seed`. Each seed
+                           gives a different basin (this is the seed-varying
+                           path; restarts > 1 keeps the best).
+              'nndsvd'  -- W = deterministic NNDSVD(S). The init is identical
+                           for every seed, so the result is seed-FREE.
+                           restarts is forced to 1 (a deterministic init has
+                           nothing to restart). Use this to test whether the
+                           per-cell anchor's seed-sensitivity is just random
+                           init or something intrinsic.
 
     Returns the best (lowest-error) W as numpy, its relative error against
     the ORIGINAL S, and the per-iteration error trace of the best restart.
@@ -389,14 +455,24 @@ def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
     norm_Swork = torch.linalg.norm(S_work)
     best_W, best_err, best_trace = None, float("inf"), None
 
+    if init == "nndsvd":
+        # deterministic init: one restart only, seed is irrelevant
+        restarts = 1
+
     for r in range(restarts):
-        g = torch.Generator(device="cpu").manual_seed(seed + r)
-        # generate on cpu for cross-device-deterministic init, then move
-        W = torch.rand((C, D), generator=g, dtype=torch.float64)
-        W = W.to(device)
-        # scale W so W W^T starts near S_work's magnitude
-        W *= torch.sqrt(norm_Swork
-                        / (torch.linalg.norm(W @ W.t()) + 1e-12))
+        if init == "nndsvd":
+            W = nndsvd_init_symmetric(S_work, D, device=device)
+            # rescale to S_work's magnitude, same as the random path
+            W *= torch.sqrt(norm_Swork
+                            / (torch.linalg.norm(W @ W.t()) + 1e-12))
+        else:
+            g = torch.Generator(device="cpu").manual_seed(seed + r)
+            # generate on cpu for cross-device-deterministic init, then move
+            W = torch.rand((C, D), generator=g, dtype=torch.float64)
+            W = W.to(device)
+            # scale W so W W^T starts near S_work's magnitude
+            W *= torch.sqrt(norm_Swork
+                            / (torch.linalg.norm(W @ W.t()) + 1e-12))
         trace = []
         prev = float("inf")
         for it in range(iters):
