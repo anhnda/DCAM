@@ -159,79 +159,133 @@ def build_S_streaming(cache_path: Path, max_chunks=None, subsample_rows=None):
 # Factorizations
 # ----------------------------------------------------------------------
 
+# All factorization math runs on torch tensors so it can use the GPU.
+# S is only C x C (~1024^2), so the matrices are tiny; the GPU mainly helps
+# the NMF multiplicative-update loop at large D. eigh/IO stay cheap either way.
+#
+# resolve_device() picks cuda if asked-for and available, else falls back to
+# cpu with a printed warning -- the script must never hard-fail on a missing
+# GPU. All tensors are float64 for numerical headroom (NMF ratios, eigh).
+
+def resolve_device(requested: str) -> str:
+    """Return a usable torch device string, falling back to cpu if needed."""
+    if torch is None:
+        print("  [device] torch not importable -> using numpy/cpu paths.")
+        return "cpu"
+    if requested == "cpu":
+        return "cpu"
+    if requested in ("cuda", "gpu") or requested.startswith("cuda:"):
+        if torch.cuda.is_available():
+            dev = "cuda" if requested in ("cuda", "gpu") else requested
+            name = torch.cuda.get_device_name(
+                0 if dev == "cuda" else int(dev.split(":")[1]))
+            print(f"  [device] using {dev}  ({name})")
+            return dev
+        print("  [device] cuda requested but not available -> cpu fallback.")
+        return "cpu"
+    return "cpu"
+
+
+def _as_tensor(S, device):
+    """numpy array -> float64 torch tensor on the given device."""
+    if torch is None:
+        return S
+    if isinstance(S, torch.Tensor):
+        return S.to(device=device, dtype=torch.float64)
+    return torch.as_tensor(S, dtype=torch.float64, device=device)
+
+
 def rel_err(S, S_hat):
+    """Relative Frobenius error. Accepts numpy arrays or torch tensors."""
+    if torch is not None and isinstance(S, torch.Tensor):
+        num = torch.linalg.norm(S - S_hat)
+        den = torch.linalg.norm(S) + 1e-12
+        return float((num / den).item())
     return float(np.linalg.norm(S - S_hat) / (np.linalg.norm(S) + 1e-12))
 
 
-def signed_eig_lowrank(S, D):
+def signed_eig_lowrank(S, D, device="cpu"):
     """Best symmetric rank-D fit: keep the D eigenpairs of largest |lambda|.
 
-    Returns S_hat and relative error. For D >= rank(S) this is ~0.
+    Runs torch.linalg.eigh on `device`. For D >= rank(S) the error is ~0.
+    Returns (S_hat as numpy, relative error).
     """
-    # S is symmetric; eigh gives ascending eigenvalues.
-    w, V = np.linalg.eigh(S)
-    order = np.argsort(np.abs(w))[::-1]             # by magnitude, descending
-    keep = order[:min(D, len(w))]
-    S_hat = (V[:, keep] * w[keep]) @ V[:, keep].T
-    return S_hat, rel_err(S, S_hat)
+    St = _as_tensor(S, device)
+    w, V = torch.linalg.eigh(St)                    # ascending eigenvalues
+    order = torch.argsort(w.abs(), descending=True)
+    keep = order[:min(D, w.shape[0])]
+    Vk = V[:, keep]
+    S_hat = (Vk * w[keep]) @ Vk.t()
+    e = rel_err(St, S_hat)
+    return S_hat.cpu().numpy(), e
 
 
-def signed_GGt_psd(S, D):
+def signed_GGt_psd(S, D, device="cpu"):
     """Signed G G^T fit, G in R^{C x D}. For a PSD S this equals the
     truncated eigendecomposition restricted to POSITIVE eigenvalues
     (G G^T is itself PSD, so it cannot use negative-eigenvalue directions).
 
     This is the fair signed analogue of NMF's W W^T (both yield PSD S_hat).
-    For a genuinely PSD S with rank <= C this is still ~0 at D >= rank.
+    Returns (S_hat as numpy, relative error, number of positive dirs used).
     """
-    w, V = np.linalg.eigh(S)
+    St = _as_tensor(S, device)
+    w, V = torch.linalg.eigh(St)
     pos = w > 0
     w_pos, V_pos = w[pos], V[:, pos]
-    order = np.argsort(w_pos)[::-1]
-    keep = order[:min(D, len(w_pos))]
-    g = V_pos[:, keep] * np.sqrt(w_pos[keep])       # [C, D']  -> G
-    S_hat = g @ g.T
-    return S_hat, rel_err(S, S_hat), g.shape[1]
+    order = torch.argsort(w_pos, descending=True)
+    keep = order[:min(D, w_pos.shape[0])]
+    g = V_pos[:, keep] * torch.sqrt(w_pos[keep])    # [C, D'] -> G
+    S_hat = g @ g.t()
+    e = rel_err(St, S_hat)
+    return S_hat.cpu().numpy(), e, int(g.shape[1])
 
 
 def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
-                  tol=1e-7, verbose=True):
+                  tol=1e-7, verbose=True, device="cpu"):
     """Symmetric NMF  S ~ W W^T,  W >= 0,  via multiplicative updates.
 
-    A stronger version of build_anchor's NMF: more iters, optional S
-    normalization to a correlation matrix, multiple random restarts, and
-    an actual convergence trace (build_anchor logs only the final iter).
+    GPU-accelerated: every per-iteration op (the [C,D] matmuls SW, W W^T W)
+    runs on `device`. This is the part that actually benefits from a GPU at
+    large D -- eigh and IO do not.
 
-    Returns the best (lowest-error) W, its relative error against the
-    ORIGINAL S, and the per-iteration error trace of the best restart.
+    A stronger version of build_anchor's NMF: more iters, optional S
+    normalization to a correlation matrix, multiple random restarts, and a
+    real convergence trace (build_anchor logs only the final iter).
+
+    Returns the best (lowest-error) W as numpy, its relative error against
+    the ORIGINAL S, and the per-iteration error trace of the best restart.
     """
-    S_work = S.copy()
-    S_work[S_work < 0] = 0.0                        # S is PSD; kill tiny negs
+    St = _as_tensor(S, device)
+    S_work = torch.clamp(St, min=0.0).clone()       # S is PSD; kill tiny negs
 
     scale_back = None
     if normalize:
-        d = np.sqrt(np.clip(np.diag(S_work), 1e-12, None))
+        d = torch.sqrt(torch.clamp(torch.diag(S_work), min=1e-12))
         Dinv = 1.0 / d
-        S_work = S_work * np.outer(Dinv, Dinv)      # correlation matrix
+        S_work = S_work * torch.outer(Dinv, Dinv)   # correlation matrix
         scale_back = d                              # to undo for reporting
 
     C = S_work.shape[0]
-    best_W, best_err, best_trace = None, np.inf, None
+    norm_Swork = torch.linalg.norm(S_work)
+    best_W, best_err, best_trace = None, float("inf"), None
 
     for r in range(restarts):
-        rng = np.random.default_rng(seed + r)
-        W = rng.random((C, D)).astype(np.float64)
+        g = torch.Generator(device="cpu").manual_seed(seed + r)
+        # generate on cpu for cross-device-deterministic init, then move
+        W = torch.rand((C, D), generator=g, dtype=torch.float64)
+        W = W.to(device)
         # scale W so W W^T starts near S_work's magnitude
-        W *= np.sqrt(np.linalg.norm(S_work) / (np.linalg.norm(W @ W.T) + 1e-12))
+        W *= torch.sqrt(norm_Swork
+                        / (torch.linalg.norm(W @ W.t()) + 1e-12))
         trace = []
-        prev = np.inf
+        prev = float("inf")
         for it in range(iters):
             SW = S_work @ W                         # [C, D]
-            WWtW = W @ (W.T @ W)                    # [C, D]
+            WWtW = W @ (W.t() @ W)                  # [C, D]
             W *= SW / (WWtW + 1e-9)
-            W = np.clip(W, 1e-9, None)
+            W = torch.clamp(W, min=1e-9)
             if (it + 1) % 50 == 0 or it == iters - 1:
-                e = rel_err(S_work, W @ W.T)
+                e = rel_err(S_work, W @ W.t())
                 trace.append((it + 1, e))
                 if verbose and ((it + 1) % 500 == 0 or it == iters - 1):
                     print(f"    [NMF D={D} restart {r}] iter {it+1}: "
@@ -245,14 +299,15 @@ def nmf_symmetric(S, D, iters=4000, restarts=3, normalize=True, seed=0,
 
         # error against the (normalized) working S, then map W back to
         # original-S scale for the reported number.
-        e_norm = rel_err(S_work, W @ W.T)
+        e_norm = rel_err(S_work, W @ W.t())
         if scale_back is not None:
             W_orig = W * scale_back[:, None]        # undo the correlation norm
-            e_orig = rel_err(S, W_orig @ W_orig.T)
+            e_orig = rel_err(St, W_orig @ W_orig.t())
         else:
             W_orig, e_orig = W, e_norm
         if e_orig < best_err:
-            best_W, best_err, best_trace = W_orig, e_orig, trace
+            best_W = W_orig.cpu().numpy()
+            best_err, best_trace = e_orig, trace
 
     return best_W, best_err, best_trace
 
@@ -287,7 +342,13 @@ def main():
                          "before NMF.")
     ap.add_argument("--out_prefix", type=str,
                     default="anchor_nonnegativity_check")
+    ap.add_argument("--device", type=str, default="cuda",
+                    help="Device for the factorization math: 'cuda', "
+                         "'cuda:N', or 'cpu'. Falls back to cpu if cuda is "
+                         "unavailable. (Streaming/IO always run on cpu.)")
     args = ap.parse_args()
+
+    device = resolve_device(args.device)
 
     cache_dir = Path(args.cache_dir)
 
@@ -328,7 +389,12 @@ def main():
     S = 0.5 * (S + S.T)
 
     # ---- spectrum summary ---------------------------------------------
-    evals = np.linalg.eigvalsh(S)[::-1]             # descending
+    if torch is not None:
+        _evt = torch.linalg.eigvalsh(
+            torch.as_tensor(S, dtype=torch.float64, device=device))
+        evals = _evt.flip(0).cpu().numpy()          # descending
+    else:
+        evals = np.linalg.eigvalsh(S)[::-1]         # descending
     pos = evals[evals > 0]
     print(f"\nS spectrum: C={C}")
     print(f"  rank(S) (eigs > 1e-9 * max): "
@@ -349,16 +415,16 @@ def main():
     for D in args.D:
         print(f"\n{'=' * 60}\nD = {D}\n{'=' * 60}")
 
-        S_eig, e_eig = signed_eig_lowrank(S, D)
+        S_eig, e_eig = signed_eig_lowrank(S, D, device=device)
         print(f"  signed eig  (best rank-D, ANY sign): rel_err = {e_eig:.5f}")
 
-        S_ggt, e_ggt, dprime = signed_GGt_psd(S, D)
+        S_ggt, e_ggt, dprime = signed_GGt_psd(S, D, device=device)
         print(f"  signed GG^T (PSD, D'={dprime} pos-eig dirs used): "
               f"rel_err = {e_ggt:.5f}")
 
         _, e_nmf, trace = nmf_symmetric(
             S, D, iters=args.nmf_iters, restarts=args.nmf_restarts,
-            normalize=not args.no_normalize)
+            normalize=not args.no_normalize, device=device)
         print(f"  NMF  W W^T  (W >= 0): rel_err = {e_nmf:.5f}")
 
         gap = e_nmf - e_ggt
