@@ -210,7 +210,7 @@ def main():
     ap.add_argument('--lambda_gradcam', type=float, default=1.0)
     ap.add_argument('--gradcam_no_normalize', action='store_true')
     ap.add_argument('--cumulative_threshold', type=float, default=0.95)
-    ap.add_argument('--top_k', type=int, default=32)
+    ap.add_argument('--top_k', type=int, default=128)
 
     # NEW: the anchor
     ap.add_argument('--ica_anchor', type=str, required=True,
