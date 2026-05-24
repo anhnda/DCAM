@@ -69,10 +69,37 @@ def atom_distance(W_a, W_b):
     return float(cost[r, c].mean())
 
 
-def load_slice(pkl_path):
-    """Pull the encoder_weight_slice tensor out of a csae_stable result
-    pickle and return it as a [hidden_dim, C] numpy array."""
-    blob = joblib.load(pkl_path)
+def load_slice(path):
+    """Pull the encoder weight slice [hidden_dim, C] out of a csae_stable
+    checkpoint. Accepts either:
+      * a *_result.pkl (reads 'encoder_weight_slice' from the saved dict),
+      * a *_model.pth (loads the state dict, slices the encoder weight,
+        and reads config from the matching *_result.pkl alongside).
+
+    Returns (W [hidden_dim, C] float64 numpy, config dict).
+    """
+    from pathlib import Path
+    p = Path(path)
+
+    if p.suffix == ".pth" or p.name.endswith("_model.pth"):
+        # state-dict path: read weights from .pth, config from sibling .pkl
+        result_path = Path(str(p).replace("_model.pth", "_result.pkl"))
+        if not result_path.exists():
+            raise FileNotFoundError(
+                f"Expected metadata {result_path} alongside {p} for the "
+                f"config dict (D_anchor, hidden_dim, etc).")
+        cfg = joblib.load(result_path).get('config', {})
+        state = torch.load(str(p), map_location='cpu')
+        # encoder.weight is [H, C, kH, kW]; for 1x1 kernel squeeze to [H, C]
+        w = state['encoder.weight']
+        if w.dim() == 4 and w.shape[2] == 1 and w.shape[3] == 1:
+            w = w[:, :, 0, 0]
+        elif w.dim() == 4:
+            w = w.mean(dim=(2, 3))                       # fallback
+        return np.asarray(w.detach().cpu().numpy(), np.float64), cfg
+
+    # default: joblib result pickle
+    blob = joblib.load(path)
     w = blob['encoder_weight_slice']
     if isinstance(w, torch.Tensor):
         w = w.detach().cpu().numpy()
@@ -100,21 +127,25 @@ def main():
     ap = argparse.ArgumentParser(
         description="Cross-seed atom-distance for csae_stable runs, "
                     "anchored vs free slices.")
-    ap.add_argument('pkls', nargs='+',
-                    help='>=2 csae_stable *_result.pkl paths.')
+    ap.add_argument('paths', nargs='+',
+                    help='>=2 csae_stable checkpoint paths. Each can be '
+                         'either a *_result.pkl (reads the saved '
+                         'encoder_weight_slice) or a *_model.pth (loads '
+                         'the state dict and auto-finds the matching '
+                         '*_result.pkl for config). Mix and match freely.')
     ap.add_argument('--D', type=int, default=None,
-                    help='Anchor atom count. If omitted, read from the first '
-                         "pkl's config (D_anchor). Use --D 0 to skip the "
-                         'split and just compare the whole encoder (for '
-                         'plain CSAE baselines).')
+                    help='Anchor atom count. If omitted, read from the '
+                         "first checkpoint's config (D_anchor). Use --D 0 "
+                         'to skip the split and just compare the whole '
+                         'encoder (for plain CSAE baselines).')
     args = ap.parse_args()
 
-    if len(args.pkls) < 2:
-        raise SystemExit("Need at least 2 result pickles to compare.")
+    if len(args.paths) < 2:
+        raise SystemExit("Need at least 2 checkpoints to compare.")
 
-    print(f"Loading {len(args.pkls)} runs:")
+    print(f"Loading {len(args.paths)} runs:")
     slices, configs = [], []
-    for p in args.pkls:
+    for p in args.paths:
         w, cfg = load_slice(p)
         slices.append(w)
         configs.append(cfg)
