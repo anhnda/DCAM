@@ -146,26 +146,47 @@ def create_test_samples_if_needed(raw_dir, test_dir, images_per_class,
 # ==========================================
 
 def load_csae_module(csae_path, device):
-    """Load a joblib-saved MultiChannelConvSAE (the .pkl produced by the
-    fixup that re-saved the .pth as a full module). Print a few sanity
-    checks so a wrong-shape checkpoint is caught early.
+    """Load a CSAE module from either:
+      * a joblib-pickled MultiChannelConvSAE (the *_model.pkl produced by
+        the .pth -> .pkl fixup), OR
+      * a state-dict .pth file -- in which case we auto-find the matching
+        *_result.pkl alongside it (replacing 'model.pth' with 'result.pkl'),
+        read C/hidden_dim/top_k from its config dict, build the module, and
+        load the state dict. No preprocessing step required.
+
+    Print a few sanity checks so a wrong-shape checkpoint is caught early.
     """
     print(f"Loading CSAE checkpoint: {csae_path}")
-    obj = joblib.load(csae_path)
-    if not isinstance(obj, MultiChannelConvSAE):
-        raise ValueError(
-            f"{csae_path} is not a MultiChannelConvSAE instance "
-            f"(got {type(obj).__name__}). If you only have the _result.pkl "
-            f"metadata blob and the _model.pth state dict, rebuild the "
-            f"module first:\n"
-            f"  meta = joblib.load('..._result.pkl')\n"
-            f"  cfg = meta['config']\n"
-            f"  m = MultiChannelConvSAE(in_channels=cfg['C'], "
-            f"hidden_dim=cfg['hidden_dim'], kernel_size=1, "
-            f"top_k=cfg['top_k'])\n"
-            f"  m.load_state_dict(torch.load('..._model.pth'))\n"
-            f"  joblib.dump(m, '..._model.pkl')")
-    module = obj.to(device).eval()
+    p = Path(csae_path)
+
+    if p.suffix == ".pth" or p.name.endswith("_model.pth"):
+        # state-dict path: find the result.pkl with the matching stem
+        result_path = Path(str(p).replace("_model.pth", "_result.pkl"))
+        if not result_path.exists():
+            raise FileNotFoundError(
+                f"Expected metadata {result_path} alongside {p}. The "
+                f"result.pkl holds C/hidden_dim/top_k needed to rebuild "
+                f"the module. If you have a non-standard layout, pass the "
+                f"joblib-pickled module path instead.")
+        print(f"  found metadata: {result_path}")
+        meta = joblib.load(result_path)
+        cfg = meta['config']
+        module = MultiChannelConvSAE(
+            in_channels=cfg['C'], hidden_dim=cfg['hidden_dim'],
+            kernel_size=1, top_k=cfg['top_k'])
+        module.load_state_dict(torch.load(str(p), map_location='cpu'))
+    else:
+        # joblib-pickled module
+        obj = joblib.load(csae_path)
+        if not isinstance(obj, MultiChannelConvSAE):
+            raise ValueError(
+                f"{csae_path} is not a MultiChannelConvSAE instance "
+                f"(got {type(obj).__name__}). Pass the *_model.pth state "
+                f"dict instead -- the loader will auto-find the matching "
+                f"*_result.pkl and rebuild the module.")
+        module = obj
+
+    module = module.to(device).eval()
     with torch.no_grad():
         W = module.encoder.weight                         # [H, C, 1, 1]
         row_norms = W[:, :, 0, 0].norm(dim=1)
