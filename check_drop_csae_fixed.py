@@ -184,10 +184,55 @@ def load_csae_module(csae_path, device):
 # Normalization -- matches run_xcsae_full.ActivationExtractor._norm_chunk
 # ==========================================
 
+def _vectorized_q99_of_positives(a_flat: torch.Tensor) -> torch.Tensor:
+    """0.99-quantile of the positive (>1e-8) entries along the last dim,
+    fully vectorized -- no Python loop over channels.
+
+    Mimics torch.quantile(positives, 0.99) with linear interpolation, which
+    is what run_xcsae_full._norm_chunk uses (it calls torch.quantile, not a
+    nearest-rank approximation, so we match that here even though it's a
+    few extra ops over a hard floor).
+
+    Input:  a_flat shape [..., N]  (non-negative; non-positives are masked out
+            by the sort-with-sentinel trick before computing the percentile).
+    Output: q shape [...] -- one quantile per leading-dim cell. Cells with
+            no positive entries return 0 (caller should treat that as
+            'leave channel untouched, set sf=1', matching _norm_chunk).
+    """
+    # Mask non-positives with -inf so they sort to the bottom and never enter
+    # the percentile index range.
+    pos = a_flat > 1e-8
+    n_pos = pos.sum(dim=-1)                              # [...]
+    neg_inf = torch.finfo(a_flat.dtype).min
+    masked = torch.where(pos, a_flat, torch.full_like(a_flat, neg_inf))
+    sorted_vals, _ = torch.sort(masked, dim=-1)          # ascending; -inf at bottom
+
+    N = a_flat.shape[-1]
+    # positives occupy indices [N - n_pos, N-1]; in those n_pos slots the
+    # 0.99-quantile with linear interp lives at offset 0.99*(n_pos - 1).
+    pos_float = (n_pos - 1).clamp(min=0).to(a_flat.dtype) * 0.99
+    lo_off = pos_float.floor().long()
+    # cap hi_off so we never index past the last positive
+    hi_off = torch.minimum(lo_off + 1, (n_pos - 1).clamp(min=0))
+    frac = pos_float - lo_off.to(a_flat.dtype)
+
+    start = N - n_pos                                    # [...]
+    lo_idx = (start + lo_off).clamp(max=N - 1)
+    hi_idx = (start + hi_off).clamp(max=N - 1)
+
+    lo_vals = sorted_vals.gather(-1, lo_idx.unsqueeze(-1)).squeeze(-1)
+    hi_vals = sorted_vals.gather(-1, hi_idx.unsqueeze(-1)).squeeze(-1)
+    q = lo_vals + frac * (hi_vals - lo_vals)
+
+    # cells with no positives: return 0 (sentinel for "no scale")
+    q = torch.where(n_pos > 0, q, torch.zeros_like(q))
+    return q
+
+
 def normalize_like_training(acts: torch.Tensor, mode: str = "per_image"
                             ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-channel 0.99-quantile clip+rescale, using torch.quantile the same
-    way training does.
+    """Per-channel 0.99-quantile clip+rescale, matching
+    run_xcsae_full.ActivationExtractor._norm_chunk.
 
     Training code, per channel c (over a 100-image chunk):
         nz = {A[c,i,j] : A[c,i,j] > 1e-8}
@@ -202,37 +247,37 @@ def normalize_like_training(acts: torch.Tensor, mode: str = "per_image"
       'per_batch' -- sf pooled over the whole batch (closer to training's
                      100-image chunk; run both to test granularity effects).
 
-    Returns (A_norm, scale_factors) where scale_factors broadcasts onto A:
+    Returns (A_norm, scale_factors) broadcastable to A:
       per_image -> [B, C, 1, 1];  per_batch -> [1, C, 1, 1].
+
+    Fully vectorized -- one sort+gather over all (B*)C rows, no Python loop.
     """
     B, C, H, W = acts.shape
     a = torch.clamp(acts, min=0.0)
 
     if mode == "per_batch":
-        sf = torch.ones(C, device=acts.device, dtype=acts.dtype)
-        for c in range(C):
-            col = a[:, c].flatten()
-            nz = col[col > 1e-8]
-            if nz.numel() > 0:
-                q = torch.quantile(nz, 0.99)
-                if q > 1e-8:
-                    sf[c] = q
+        # pool over batch+spatial: shape [C, B*H*W]
+        a_flat = a.permute(1, 0, 2, 3).reshape(C, -1)
+        q = _vectorized_q99_of_positives(a_flat)         # [C]
+        # match _norm_chunk: if q<=1e-8, leave channel raw (sf=1, no clip)
+        valid = q > 1e-8
+        sf = torch.where(valid, q, torch.ones_like(q))   # [C]
         sf_b = sf.view(1, C, 1, 1)
         normalized = torch.minimum(a, sf_b) / (sf_b + 1e-8)
+        # restore raw acts on invalid channels (no quantile to clip to)
+        normalized = torch.where(valid.view(1, C, 1, 1),
+                                 normalized, acts)
         return normalized, sf_b
 
-    # per_image
-    sf = torch.ones(B, C, device=acts.device, dtype=acts.dtype)
-    for b in range(B):
-        for c in range(C):
-            col = a[b, c].flatten()
-            nz = col[col > 1e-8]
-            if nz.numel() > 0:
-                q = torch.quantile(nz, 0.99)
-                if q > 1e-8:
-                    sf[b, c] = q
+    # per_image: shape [B, C, H*W]
+    a_flat = a.view(B, C, H * W)
+    q = _vectorized_q99_of_positives(a_flat)             # [B, C]
+    valid = q > 1e-8
+    sf = torch.where(valid, q, torch.ones_like(q))       # [B, C]
     sf_b = sf.view(B, C, 1, 1)
     normalized = torch.minimum(a, sf_b) / (sf_b + 1e-8)
+    normalized = torch.where(valid.view(B, C, 1, 1),
+                             normalized, acts)
     return normalized, sf_b
 
 
