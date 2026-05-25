@@ -126,6 +126,14 @@ def saliency_for_corner(backbone: CAMBackbone, acts_norm: torch.Tensor,
     return sal, diag
 
 
+def _trapz(y: np.ndarray, x: np.ndarray) -> float:
+    """Trapezoidal integral, robust to the NumPy 2.0 rename of trapz->trapezoid.
+    Older NumPy only has np.trapz; newer deprecates it in favour of
+    np.trapezoid. Use whichever exists so the harness runs on both."""
+    fn = getattr(np, "trapezoid", None) or np.trapz
+    return float(fn(y, x))
+
+
 def _unit_normalize(m: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     m = m - m.min()
     mx = m.max().clamp(min=eps)
@@ -219,8 +227,8 @@ def deletion_insertion_auc(backbone: CAMBackbone, x_pre: torch.Tensor,
 
     fr = np.asarray(fracs)
     return {
-        "deletion_auc": float(np.trapz(np.asarray(del_scores), fr)),
-        "insertion_auc": float(np.trapz(np.asarray(ins_scores), fr)),
+        "deletion_auc": float(_trapz(np.asarray(del_scores), fr)),
+        "insertion_auc": float(_trapz(np.asarray(ins_scores), fr)),
     }
 
 
@@ -436,6 +444,7 @@ class PerImageRow:
     lam_value: Optional[float] = None
     bw_value: Optional[float] = None
     is_control: bool = False
+    query_uid: int = -1
 
 
 def run_protocol(args) -> None:
@@ -473,7 +482,19 @@ def run_protocol(args) -> None:
     images = load_class_images(test_meta, args.class_id, args.offset,
                                args.n_images)
 
-    for (img, local_idx) in images:
+    # local_idx can REPEAT: load_class_images wraps with modulo over the cached
+    # samples, so a request for n_images > (cached samples of the class) yields
+    # duplicate local_idx values. Keying rows by local_idx would then merge
+    # distinct queries in the paired bootstrap. We key by a monotonic query_uid
+    # instead, and warn if local_idx actually collides (duplicate queries are
+    # not independent samples -- the effective n is smaller than n_images).
+    seen_idx = set()
+    n_collisions = 0
+
+    for q_uid, (img, local_idx) in enumerate(images):
+        if local_idx in seen_idx:
+            n_collisions += 1
+        seen_idx.add(local_idx)
         # query activations + alpha (the exact tensors the solver consumes)
         A_query_raw, alpha_query, pred_label = backbone.acts_and_alpha(img)
         A_query_norm = normalize_acts(A_query_raw.cpu())
@@ -525,14 +546,16 @@ def run_protocol(args) -> None:
                 eigengap=diag["eigengap"],
                 seed_invariant=diag["seed_invariant"],
                 spatial_cos=diag["spatial_cos"],
-                lam_value=lam, bw_value=bw))
+                lam_value=lam, bw_value=bw, query_uid=q_uid))
 
         # ---- no-box sanity controls: random map (floor) + negated best map ----
         if not args.no_controls:
             H, W = A_query_norm.shape[-2], A_query_norm.shape[-1]
-            # random floor (averaged over a few draws to stabilise the estimate)
+            # random floor (averaged over a few draws to stabilise the estimate).
+            # seed by q_uid (unique) not local_idx (can repeat) so duplicate
+            # queries still get independent random draws.
             for d in range(args.n_random_draws):
-                rmap = upsample_map(random_saliency(H, W, seed=local_idx * 97 + d),
+                rmap = upsample_map(random_saliency(H, W, seed=q_uid * 97 + d),
                                     224)
                 rc = deletion_insertion_auc(
                     backbone, x_pre, rmap, args.class_id,
@@ -548,10 +571,27 @@ def run_protocol(args) -> None:
                     sufficiency=rcs["sufficiency"],
                     pointing_hit=None, iou=None,
                     eigengap=float("nan"), seed_invariant=False,
-                    spatial_cos=float("nan"), is_control=True))
+                    spatial_cos=float("nan"), is_control=True,
+                    query_uid=q_uid))
 
-        print(f"  scored image {local_idx}  "
-              f"({len([r for r in rows if r.image_idx == local_idx])} methods)")
+        n_methods = len([r for r in rows if r.query_uid == q_uid
+                         and not r.is_control])
+        print(f"  scored query {q_uid} (local_idx {local_idx}): "
+              f"{n_methods} methods")
+
+    if n_collisions:
+        print("\n" + "!" * 76)
+        print(f"WARNING: {n_collisions} of {len(images)} requested images were "
+              f"DUPLICATES of\nearlier ones (the class has fewer cached samples "
+              f"than --n_images={args.n_images}).\nload_class_images wraps with "
+              "modulo, so you re-scored the same images. The\neffective sample "
+              f"size is ~{len(seen_idx)} unique images, NOT {args.n_images}. "
+              "The paired\nbootstrap below keys on a unique query id so the "
+              "stats are not corrupted, but\nyour CIs are narrower than the true "
+              "independent-sample CIs would be. Lower\n--n_images to "
+              f"{len(seen_idx)} (or widen --bank_classes / the cached set) for "
+              "honest n.")
+        print("!" * 76)
 
     _summarize(rows, method_specs, do_loc, args)
 
@@ -560,16 +600,19 @@ def _summarize(rows: List[PerImageRow], method_specs, do_loc: bool, args):
     labels = [s[0] for s in method_specs]
 
     def col(method, attr, paired_with=None):
-        """Per-image values for `method`. If paired_with is given, return only
-        images present in BOTH, in matched image order, so paired_bootstrap
-        compares like with like."""
-        rs = {r.image_idx: getattr(r, attr) for r in rows
+        """Per-query values for `method`. If paired_with is given, return only
+        queries present in BOTH, in matched query order, so paired_bootstrap
+        compares like with like. Keyed on query_uid (unique per processed
+        image) NOT image_idx (which can repeat when --n_images exceeds the
+        cached sample count) -- keying on image_idx would silently merge
+        distinct queries via dict-key collision and corrupt the pairing."""
+        rs = {r.query_uid: getattr(r, attr) for r in rows
               if r.method == method and getattr(r, attr) is not None
               and not (isinstance(getattr(r, attr), float)
                        and np.isnan(getattr(r, attr)))}
         if paired_with is None:
             return np.asarray(list(rs.values()), dtype=float)
-        os_ = {r.image_idx for r in rows if r.method == paired_with}
+        os_ = {r.query_uid for r in rows if r.method == paired_with}
         keys = sorted(k for k in rs if k in os_)
         return np.asarray([rs[k] for k in keys], dtype=float)
 
