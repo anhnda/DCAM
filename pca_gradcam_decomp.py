@@ -86,8 +86,8 @@ from PIL import Image
 from torchvision import transforms
 
 sys.path.append('.')
-from run_xcsae_full import MultiChannelConvSAE
-from csae_pca_baseline import PCAReconstructor   # noqa: F401 (pickle import)
+#from run_xcsae_full import MultiChannelConvSAE
+#from csae_pca_baseline import PCAReconstructor   # noqa: F401 (pickle import)
 from src.gradcam import GradCAM
 from full_classes import IMAGENET2012_CLASSES
 
