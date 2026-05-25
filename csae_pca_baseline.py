@@ -111,34 +111,62 @@ class PCAReconstructor(MultiChannelConvSAE):
 
     def __init__(self, in_channels: int, D: int,
                  mu: torch.Tensor, V: torch.Tensor):
-        # top_k = D so the eval's "expected active = top_k/hidden_dim" prints
-        # 100% (dense), matching that every component is used.
-        super().__init__(in_channels=in_channels, hidden_dim=D,
-                         kernel_size=1, top_k=D)
-        # store the basis as buffers so .to(device) / pickling carry them
-        self.register_buffer('pca_mu', mu.view(in_channels).contiguous())
-        self.register_buffer('pca_V', V.contiguous())        # [C, D]
+        # D == 0 is the MEAN-ONLY control: reconstruct every cell as mu, with
+        # NO projection. This is the critical baseline -- if it classifies
+        # well, the "PCA works" result is really "the mean activation pattern
+        # classifies" (an eval artifact). If it's near-chance, the projection
+        # is doing the real work.
+        #
+        # The Conv2d skeleton needs >=1 hidden unit, so for D==0 we build it
+        # with hidden_dim=1 (unused) and flag pca_rank=0.
+        D = int(D)
+        hd = max(D, 1)
+        # top_k = hd so the eval's "expected active = top_k/hidden_dim" prints
+        # 100% (dense); every kept component is used.
+        super().__init__(in_channels=in_channels, hidden_dim=hd,
+                         kernel_size=1, top_k=hd)
         self.pca_rank = D
+        self.register_buffer('pca_mu', mu.view(in_channels).contiguous())
 
-        # Make encoder/decoder weights MEANINGFUL (not used by forward, but the
-        # loader prints encoder row-norms as a sanity check): encoder row d =
-        # eigenvector d (unit norm), decoder column d = same.
-        with torch.no_grad():
-            self.encoder.weight.copy_(V.T.view(D, in_channels, 1, 1))
-            if self.encoder.bias is not None:
-                self.encoder.bias.zero_()
-            self.decoder.weight.copy_(V.view(in_channels, D, 1, 1))
+        if D > 0:
+            self.register_buffer('pca_V', V.contiguous())        # [C, D]
+            # Make encoder/decoder weights MEANINGFUL (unused by forward, but
+            # the loader prints encoder row-norms as a sanity check): encoder
+            # row d = eigenvector d (unit norm), decoder column d = same.
+            with torch.no_grad():
+                self.encoder.weight.copy_(V.T.view(D, in_channels, 1, 1))
+                if self.encoder.bias is not None:
+                    self.encoder.bias.zero_()
+                self.decoder.weight.copy_(V.view(in_channels, D, 1, 1))
+        else:
+            # mean-only: no basis. Empty V buffer; zero the (unused) skeleton
+            # weights so the loader's row-norm print reads ~0 -- a clear visual
+            # signal that this checkpoint is the mean-only control.
+            self.register_buffer('pca_V', torch.zeros(in_channels, 0))
+            with torch.no_grad():
+                self.encoder.weight.zero_()
+                if self.encoder.bias is not None:
+                    self.encoder.bias.zero_()
+                self.decoder.weight.zero_()
 
     def forward(self, x: torch.Tensor, use_topk: bool = True):
-        # x: [B, C, H, W]; project each spatial cell onto the top-D subspace.
+        # x: [B, C, H, W]
         B, C, H, W = x.shape
-        xc = x.permute(0, 2, 3, 1).reshape(-1, C)            # [N, C]
-        centered = xc - self.pca_mu                          # [N, C]
-        coeff = centered @ self.pca_V                        # [N, D]
-        recon = coeff @ self.pca_V.T + self.pca_mu           # [N, C]
-
-        recon = recon.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        z = coeff.view(B, H, W, self.pca_rank).permute(0, 3, 1, 2).contiguous()
+        if self.pca_rank > 0:
+            # project each spatial cell onto the top-D subspace
+            xc = x.permute(0, 2, 3, 1).reshape(-1, C)        # [N, C]
+            centered = xc - self.pca_mu                      # [N, C]
+            coeff = centered @ self.pca_V                    # [N, D]
+            recon = coeff @ self.pca_V.T + self.pca_mu       # [N, C]
+            recon = recon.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            z = coeff.view(B, H, W, self.pca_rank).permute(
+                0, 3, 1, 2).contiguous()
+        else:
+            # mean-only: every cell -> mu (broadcast). z is a single dead unit
+            # so the eval's (z>0) sparsity stat is well-defined (0% active).
+            recon = self.pca_mu.view(1, C, 1, 1).expand(
+                B, C, H, W).contiguous()
+            z = torch.zeros(B, 1, H, W, device=x.device, dtype=x.dtype)
         return recon, z
 
 
@@ -174,24 +202,32 @@ def build_pca_reconstructor(cache_path: Path, D: int,
     V = V.flip(1)                                    # [C, C], columns = eigvecs
 
     total_var = float(w.sum().item())
-    evr = float(w[:D].sum().item()) / max(total_var, 1e-12)
-    Vk = V[:, :D]                                    # [C, D]
+    Vk = V[:, :D]                                    # [C, D]  (empty if D==0)
+    evr = (float(w[:D].sum().item()) / max(total_var, 1e-12)) if D > 0 else 0.0
 
     print(f"\n{'='*64}")
-    print(f"  PCA basis: C={C}, D={D}")
-    print(f"  eigval range (top-D) [{w[D-1]:.4e}, {w[0]:.4e}]")
-    print(f"  EXPLAINED VARIANCE at D={D}: {evr:.4f} "
-          f"({100*evr:.1f}% of normalized per-cell variance)")
+    if D == 0:
+        print(f"  MEAN-ONLY baseline (D=0): every cell reconstructed as mu, "
+              f"no projection.  C={C}")
+        print(f"  CONTROL: if accuracy here is high, the 'PCA works' result "
+              f"is really 'the mean pattern classifies' (eval artifact). "
+              f"If near-chance, the projection does the work.")
+    else:
+        print(f"  PCA basis: C={C}, D={D}")
+        print(f"  eigval range (top-D) [{w[D-1]:.4e}, {w[0]:.4e}]")
+        print(f"  EXPLAINED VARIANCE at D={D}: {evr:.4f} "
+              f"({100*evr:.1f}% of normalized per-cell variance)")
     # where does cumulative variance hit common thresholds?
     cum = torch.cumsum(w, dim=0) / max(total_var, 1e-12)
     for thr in (0.90, 0.95, 0.99):
         k = int(torch.searchsorted(
-            cum, torch.tensor(thr, dtype=cum.dtype, device=cum.device)).item()) + 1
+            cum, torch.tensor(thr, dtype=cum.dtype, device=cum.device)
+        ).item()) + 1
         print(f"    {int(thr*100)}% variance reached at rank {k}")
     print(f"{'='*64}")
 
     mu32 = torch.as_tensor(mean, dtype=torch.float32)
-    V32 = Vk.to(torch.float32).cpu()
+    V32 = Vk.to(torch.float32).cpu()                 # [C, D]; [C, 0] if D==0
     module = PCAReconstructor(in_channels=C, D=D, mu=mu32, V=V32).cpu().eval()
 
     diag = {'C': C, 'D': D, 'explained_variance_ratio': evr,
@@ -210,7 +246,10 @@ def main():
                          "--cache_dir (same one used for the CSAE).")
     ap.add_argument("--D", type=int, default=200,
                     help="PCA rank. Sweep this; accuracy should saturate near "
-                         "the true effective rank (~200 for ResNet50 layer3).")
+                         "the true effective rank. D=0 is the MEAN-ONLY "
+                         "control (reconstruct every cell as mu, no "
+                         "projection) -- run it first to check the result "
+                         "isn't just the mean pattern classifying.")
     ap.add_argument("--subsample_cells", type=int, default=200000)
     ap.add_argument("--max_chunks", type=int, default=None)
     ap.add_argument("--device", type=str, default="auto",
