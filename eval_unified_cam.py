@@ -479,15 +479,41 @@ def run_protocol(args) -> None:
         print("!" * 76 + "\n")
 
     rows: List[PerImageRow] = []
-    images = load_class_images(test_meta, args.class_id, args.offset,
-                               args.n_images)
+    images_raw = load_class_images(test_meta, args.class_id, args.offset,
+                                   args.n_images)
 
-    # local_idx can REPEAT: load_class_images wraps with modulo over the cached
-    # samples, so a request for n_images > (cached samples of the class) yields
-    # duplicate local_idx values. Keying rows by local_idx would then merge
-    # distinct queries in the paired bootstrap. We key by a monotonic query_uid
-    # instead, and warn if local_idx actually collides (duplicate queries are
-    # not independent samples -- the effective n is smaller than n_images).
+    # load_class_images wraps with modulo over the class's cached samples
+    # (idx = (offset+k) % n in run_unified_cam), so requesting n_images >
+    # (cached samples of the class) returns BYTE-IDENTICAL duplicate images
+    # with repeating local_idx. A duplicate is not a new sample: scoring it
+    # again costs a full solve and, counted as independent, fakes a larger n
+    # and shrinks the bootstrap CIs below what the data supports. So we
+    # DEDUPLICATE here by default -- keep first occurrence of each local_idx --
+    # rather than score copies. --allow_duplicate_images opts back in (e.g. to
+    # measure solver/seed nondeterminism on the same image), in which case the
+    # rows are kept distinct by query_uid and the end-of-run warning fires.
+    if args.allow_duplicate_images:
+        images = images_raw
+    else:
+        seen, images = set(), []
+        for (img, lidx) in images_raw:
+            if lidx in seen:
+                continue
+            seen.add(lidx)
+            images.append((img, lidx))
+        if len(images) < len(images_raw):
+            print("\n" + "-" * 76)
+            print(f"NOTE: class {args.class_id} has only {len(images)} cached "
+                  f"images, but --n_images={args.n_images} was requested.")
+            print(f"Scoring the {len(images)} UNIQUE images once each "
+                  f"(dropped {len(images_raw) - len(images)} modulo-wrap "
+                  "duplicates).")
+            print("Effective sample size = %d. To raise n, widen the cached "
+                  "set or" % len(images))
+            print("pass --bank_classes / score more classes. "
+                  "--allow_duplicate_images keeps copies.")
+            print("-" * 76)
+
     seen_idx = set()
     n_collisions = 0
 
@@ -579,18 +605,18 @@ def run_protocol(args) -> None:
         print(f"  scored query {q_uid} (local_idx {local_idx}): "
               f"{n_methods} methods")
 
-    if n_collisions:
+    if n_collisions and args.allow_duplicate_images:
         print("\n" + "!" * 76)
-        print(f"WARNING: {n_collisions} of {len(images)} requested images were "
-              f"DUPLICATES of\nearlier ones (the class has fewer cached samples "
-              f"than --n_images={args.n_images}).\nload_class_images wraps with "
-              "modulo, so you re-scored the same images. The\neffective sample "
-              f"size is ~{len(seen_idx)} unique images, NOT {args.n_images}. "
-              "The paired\nbootstrap below keys on a unique query id so the "
-              "stats are not corrupted, but\nyour CIs are narrower than the true "
-              "independent-sample CIs would be. Lower\n--n_images to "
-              f"{len(seen_idx)} (or widen --bank_classes / the cached set) for "
-              "honest n.")
+        print(f"WARNING: --allow_duplicate_images was set and {n_collisions} of "
+              f"{len(images)} scored\nimages were modulo-wrap DUPLICATES (class "
+              f"has ~{len(seen_idx)} unique cached images,\n--n_images="
+              f"{args.n_images}). The paired bootstrap keys on query_uid so the "
+              "stats are\nnot corrupted, but duplicates are NOT independent "
+              "samples: your effective n is\n~%d and the CIs below are narrower "
+              "than honest independent-sample CIs. This\nmode is only "
+              "meaningful for measuring solver/seed nondeterminism on a fixed\n"
+              "image -- do not report these CIs as if n=%d."
+              % (len(seen_idx), args.n_images))
         print("!" * 76)
 
     _summarize(rows, method_specs, do_loc, args)
@@ -771,6 +797,11 @@ def main():
     ap.add_argument('--class_id', type=int, required=True)
     ap.add_argument('--offset', type=int, default=0)
     ap.add_argument('--n_images', type=int, default=50)
+    ap.add_argument('--allow_duplicate_images', action='store_true',
+                    help='Score modulo-wrap duplicate images instead of '
+                         'deduplicating. Only for measuring solver/seed '
+                         'nondeterminism on a fixed image; duplicates are not '
+                         'independent samples and must not be counted as n.')
     ap.add_argument('--methods', type=str, nargs='+',
                     default=['grad_cam', 'eigen_cam', 'dcam', 'new_interior'],
                     help=f"corners to compare; choose from "
