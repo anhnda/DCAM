@@ -281,27 +281,47 @@ def class_second_moment(mb: MomentBundle, alpha: torch.Tensor,
                          w: torch.Tensor) -> torch.Tensor:
     """Sigma^w_alpha : the class-evidence second moment in feature space.
 
-    The class term wants P to preserve the directions that carry the
-    pre-ReLU explanation. For the current weighting field alpha (one [C]
-    vector per bank image, here broadcast as a shared [C] query field), the
-    per-cell class signal in feature space is
+    THIS IS THE TERM THAT COUPLES alpha BACK INTO THE P-BLOCK. The paper's
+    blended second moment is Sigma_{phi,w,lambda} = (1-lambda) Sigma^w_phi +
+    lambda Sigma^w_alpha, and the WHOLE point of the joint solver (vs two
+    independent fits) is that Sigma^w_alpha depends on the CURRENT alpha. If it
+    depended only on alpha's magnitude, the P-block would see essentially the
+    same Sigma every iteration, block descent would converge in one step, and
+    the bilinear structure the paper builds Option B on would be invisible.
 
-        g_{i,p} = alpha_i . (contribution of cell p)   -> projected to phi-space.
+    Construction. The class term of J wants P to preserve the directions of
+    feature space that carry the pre-ReLU explanation L~(x) = <alpha, A(x)>.
+    Differentiating the class term in P (alpha fixed) gives a second moment
+    whose samples are the per-cell, alpha-WEIGHTED feature contributions:
 
-    We use the standard DCAM construction: Sigma_alpha = weighted covariance of
-    the alpha-reweighted feature cells. This is the term that, at lambda=1,
-    w=global, makes the P-block return DCAM's "top-D of Sigma_alpha".
+        for cell p of image i,   g_{i,p} = ( alpha . a_{i,p} ) * c_{i,p}
+
+    where a_{i,p} is the raw activation vector at that cell, c_{i,p} is the
+    CENTRED feature-space cell phi(a)-mu, and (alpha . a_{i,p}) is the SCALAR
+    class evidence that cell contributes. Sigma^w_alpha = sum w_i/P g g^T.
+
+    Because the scalar weight (alpha . a_{i,p}) is a genuine inner product with
+    alpha, this second moment turns -- in direction, not just scale -- as alpha
+    updates. That is the bilinear coupling, and it is what makes the J sequence
+    actually move across iterations.
+
+    At lambda=1, w=global this recovers DCAM's "top-D of Sigma_alpha": P is the
+    leading subspace of the covariance of the class-evidence-weighted cells.
     """
     N, Pn, Fdim = mb.feat_cells.shape
-    # reweight each image's centred feature cells by its scalar alpha energy
-    a_energy = alpha.norm(dim=-1) if alpha.dim() == 2 else alpha.norm()
-    if torch.is_tensor(a_energy) and a_energy.dim() == 1:
-        scale = a_energy.view(N, 1, 1)
-    else:
-        scale = float(a_energy)
-    g = mb.feat_cells * scale                          # [N,P,F]
+    dt = mb.feat_cells.dtype
+
+    # per-cell scalar class evidence  s_{i,p} = alpha . a_{i,p}
+    # alpha may be a shared [C] query field or a per-image [N,C] bank of rules.
+    if alpha.dim() == 2:                                # [N, C]
+        s = torch.einsum("nc,npc->np", alpha.to(dt), mb.raw_cells)
+    else:                                               # [C] shared field
+        s = torch.einsum("c,npc->np", alpha.to(dt), mb.raw_cells)   # [N,P]
+
+    # alpha-weighted centred feature cells  g_{i,p} = s_{i,p} * c_{i,p}
+    g = mb.feat_cells * s.unsqueeze(-1)                 # [N,P,F]
     flat = g.reshape(N * Pn, Fdim)
-    wflat = (w.view(N, 1).expand(N, Pn).reshape(-1) / Pn).to(flat.dtype)
+    wflat = (w.view(N, 1).expand(N, Pn).reshape(-1) / Pn).to(dt)
     Sig = (flat * wflat.unsqueeze(1)).T @ flat
     return 0.5 * (Sig + Sig.T)
 

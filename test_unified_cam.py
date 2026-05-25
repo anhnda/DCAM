@@ -85,17 +85,28 @@ def _ok(name, cond, detail=""):
 def test_monotone():
     print("\nT1  Proposition 1: block descent is monotone non-increasing")
     acts, alpha_bank = make_synthetic()
-    cfg = config_for_corner("dcam", D=8)
-    cfg.dtype = "float64"; cfg.device = "cpu"; cfg.max_iter = 30
+    # Use the interior corner (lambda=0.5, bandwidth w): the blended Sigma
+    # genuinely depends on both blocks, so descent takes SEVERAL iterations --
+    # which is what makes the monotonicity claim non-vacuous to test. The
+    # one-shot DCAM corner would converge in a single step and the
+    # "non-increasing sequence" check would be trivially true on length 1.
+    cfg = config_for_corner("new_interior", D=8)
+    cfg.dtype = "float64"; cfg.device = "cpu"; cfg.max_iter = 40
+    cfg.lam = 0.5; cfg.bandwidth = 1.0
     res = solve(acts, alpha_bank, alpha_bank[0], 0, cfg, solver="block")
     J = res.J_history
-    # allow tiny float slack
+    # the test is only meaningful on a real trajectory: demand >= 3 iterations
+    long_enough = len(J) >= 3
     monotone = all(J[i + 1] <= J[i] + 1e-6 * (abs(J[i]) + 1e-9)
                    for i in range(len(J) - 1))
-    converged = abs(J[-1] - J[-2]) < 1e-4 * (abs(J[-2]) + 1e-9) if len(J) > 1 \
-        else True
-    return (_ok("J non-increasing", monotone,
-                f"{len(J)} iters, J: {J[0]:.4e} -> {J[-1]:.4e}")
+    converged = (abs(J[-1] - J[-2]) < 1e-4 * (abs(J[-2]) + 1e-9)
+                 if len(J) > 1 else False)
+    strictly_moved = len(J) > 1 and J[-1] < J[0] - 1e-9
+    return (_ok("descent ran a genuine multi-iteration trajectory (>=3)",
+                long_enough, f"{len(J)} iterations")
+            and _ok("J non-increasing across the sequence", monotone,
+                    f"J: {J[0]:.4e} -> {J[-1]:.4e}")
+            and _ok("J strictly decreased (coupling is live)", strictly_moved)
             and _ok("J converged", converged))
 
 
@@ -189,12 +200,16 @@ def test_option_A_equals_B():
     acts, alpha_bank = make_synthetic(true_rank=8, noise=0.01)
     cfg = config_for_corner("dcam", D=10)
     cfg.dtype = "float64"; cfg.device = "cpu"
-    cfg.max_iter = 60; cfg.lr = 0.02
+    # With the corrected (direction-dependent) Sigma_alpha the objective has
+    # genuine bilinear coupling, so Option A needs enough iterations / a small
+    # enough step to settle into the same basin as the exact block solver.
+    cfg.max_iter = 120; cfg.lr = 0.02
     res_b = solve(acts, alpha_bank, alpha_bank[0], 0, cfg, solver="block")
     res_a = solve(acts, alpha_bank, alpha_bank[0], 0, cfg, solver="joint")
     Jb = res_b.diagnostics["J_final"]
     Ja = res_a.diagnostics["J_final"]
-    # joint descent is first-order; allow a loose relative tolerance
+    # joint descent is first-order; allow a loose relative tolerance. Option A
+    # should not BEAT the exact block minimiser by more than slack either.
     rel = abs(Ja - Jb) / (abs(Jb) + 1e-9)
     return _ok("J_joint ~ J_block (rel diff < 5%)", rel < 0.05,
                f"J_block={Jb:.4e}  J_joint={Ja:.4e}  rel={rel:.3f}")
