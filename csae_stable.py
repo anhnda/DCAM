@@ -284,7 +284,7 @@ def main():
             print(f"  NOTE: --anchor_mode full forces hidden_dim = D = "
                   f"{D_anchor} (ignoring --hidden_dim {args.hidden_dim}).")
     else:
-        hidden_dim = args.hidden_dim if args.hidden_dim is not None else C * 8
+        hidden_dim = args.hidden_dim if args.hidden_dim is not None else C * 2
         if hidden_dim < D_anchor:
             raise ValueError(f"hidden_dim {hidden_dim} < D {D_anchor}.")
     print(f"\nEncoder hidden_dim = {hidden_dim}  "

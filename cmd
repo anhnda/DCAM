@@ -7,9 +7,10 @@ python csae_stable.py --ica_anchor csae_svd_anchor_W0.npy     --anchor_mode subs
 python check_drop_csae_fixed.py     --model resnet50     --csae_model imagenet1k_csae_stable_resnet50_subspace_la0.01_seed42-0_model.pkl     --norm_mode per_image --debug_batches 3
 
 python compare_csae_stable_seeds.py \
-    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed0-0_result.pkl \
-    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed0-1_result.pkl \
-    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed0-2_result.pkl
+    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed42-0_model.pth \
+    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed42-1_model.pth \
+    imagenet1k_csae_stable_resnet50_subspace_la0.01_seed42-2_model.pth
+
 
 import torch, joblib
 from run_xcsae_full import MultiChannelConvSAE
