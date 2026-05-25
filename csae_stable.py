@@ -72,6 +72,8 @@ Then compare encoders across seeds with atom_distance (see compare_seeds()).
 """
 
 import torch
+
+from ProtoPNet import model
 torch.cuda.init()
 
 import torch.nn as nn
@@ -123,16 +125,18 @@ def encoder_weight_slice(model: MultiChannelConvSAE) -> torch.Tensor:
 
 
 def anchor_loss(model: MultiChannelConvSAE, W0: torch.Tensor,
-                mode: str) -> torch.Tensor:
+                mode: str, metric: str = "cosine") -> torch.Tensor:
     """Soft stability prior: pull encoder weights toward the fixed signed
-    ICA anchor W0 [D, C].
+    anchor W0 [D, C].
+
+    metric 'cosine' (DEFAULT): 1 - |cos(W_enc[d], W0[d])|, averaged. Pins the
+        channel-COMBINATION (a direction) and lets magnitude float -- removes
+        the spurious norm fight with the untied decoder + decoder-norm step.
+    metric 'l2'    : original mean squared row-difference (also pins norm,
+        since W0 rows are unit-norm).
 
     mode 'subspace': anchor the FIRST D hidden units; others unconstrained.
     mode 'full'    : anchor ALL hidden units (requires hidden_dim == D).
-
-    Returned value is the mean squared row-difference over anchored atoms,
-    so its scale does not grow with D and LAMBDA_ANCHOR is comparable across
-    D settings.
     """
     W_enc = encoder_weight_slice(model)             # [H, C]
     D = W0.shape[0]
@@ -142,26 +146,34 @@ def anchor_loss(model: MultiChannelConvSAE, W0: torch.Tensor,
                 f"--anchor_mode full needs hidden_dim == D ({D}); "
                 f"encoder has {W_enc.shape[0]} hidden units. "
                 f"Set --hidden_dim {D} or use --anchor_mode subspace.")
-        diff = W_enc - W0
+        W_sel = W_enc
     else:  # subspace
         if W_enc.shape[0] < D:
             raise ValueError(
                 f"hidden_dim ({W_enc.shape[0]}) < D ({D}); cannot anchor a "
                 f"D-row subspace. Raise hidden_dim or lower D.")
-        diff = W_enc[:D] - W0                       # first D units only
-    return (diff ** 2).sum(dim=1).mean()            # mean over anchored atoms
+        W_sel = W_enc[:D]                           # first D units only
 
+    if metric == "cosine":
+        Wn = W_sel / (W_sel.norm(dim=1, keepdim=True) + 1e-8)
+        W0n = W0 / (W0.norm(dim=1, keepdim=True) + 1e-8)
+        cos = (Wn * W0n).sum(dim=1)                 # [D]
+        return (1.0 - cos.abs()).mean()             # sign-invariant
+    else:  # l2
+        diff = W_sel - W0
+        return (diff ** 2).sum(dim=1).mean()
 
 # ==========================================
 # Seed-comparison helper (for after training)
 # ==========================================
 
 @torch.no_grad()
-def atom_distance(W_a: torch.Tensor, W_b: torch.Tensor) -> float:
-    """Sign/permutation-invariant matched distance between two encoder
-    weight slices [H, C]. Hungarian matching on (1 - |cosine|); returns the
-    mean matched value. This is the seed-stability metric: run two model
-    seeds, compare their encoders, lower = more stable."""
+def atom_distances_vector(W_a: torch.Tensor, W_b: torch.Tensor) -> np.ndarray:
+    """Sign/permutation-invariant matched PER-ATOM distance between two
+    encoder weight slices [H, C]. Hungarian on (1 - |cos|); returns the
+    vector of matched costs (length min(Ha, Hb)). Histogram this across seed
+    pairs: BIMODAL -> a stable core of parts + an unstable filler tail;
+    UNIMODAL-HIGH -> no shared atoms (the counting argument won)."""
     from scipy.optimize import linear_sum_assignment
     A = W_a.detach().cpu().numpy().astype(np.float64)
     B = W_b.detach().cpu().numpy().astype(np.float64)
@@ -170,25 +182,77 @@ def atom_distance(W_a: torch.Tensor, W_b: torch.Tensor) -> float:
     cos = An @ Bn.T
     cost = 1.0 - np.abs(cos)
     r, c = linear_sum_assignment(cost)
-    return float(cost[r, c].mean())
+    return cost[r, c]
 
 
-def compare_seeds(model_paths):
-    """Load >=2 saved csae_stable encoders and print pairwise atom_distance.
-    Use after training several --model_seed runs."""
-    slices = []
-    for p in model_paths:
-        blob = joblib.load(p)
-        # saved as a dict with 'encoder_weight_slice'
-        slices.append(torch.as_tensor(blob['encoder_weight_slice']))
-    print(f"\nSeed-stability: pairwise matched atom distance "
-          f"({len(slices)} runs)")
+@torch.no_grad()
+def atom_distance(W_a: torch.Tensor, W_b: torch.Tensor) -> float:
+    """Mean matched distance (back-compat wrapper)."""
+    return float(atom_distances_vector(W_a, W_b).mean())
+
+
+@torch.no_grad()
+def direct_row_distance(W_a: torch.Tensor, W_b: torch.Tensor) -> np.ndarray:
+    """DIRECT (no permutation) per-row 1-|cos|. For the ANCHORED block, both
+    seeds pin row d to the SAME W0[d], so row-d-to-row-d is the honest metric
+    -- Hungarian could permute and report best-case. Use this for anchored;
+    use the Hungarian vector for the free block (no canonical order there)."""
+    A = W_a.detach().cpu().numpy().astype(np.float64)
+    B = W_b.detach().cpu().numpy().astype(np.float64)
+    An = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+    Bn = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-12)
+    cos = (An * Bn).sum(axis=1)
+    return 1.0 - np.abs(cos)
+
+def compare_seeds(model_paths, dist_threshold: float = 0.1):
+    """Load >=2 saved csae_stable encoders and report seed-stability split by
+    block. The constructive claim is anchored << free: the anchor CAUSES the
+    stability (free block is its own control)."""
+    blobs = [joblib.load(p) for p in model_paths]
+    slices = [torch.as_tensor(b['encoder_weight_slice']) for b in blobs]
+    Ds = [b['config']['D_anchor'] for b in blobs]
+    D = min(Ds)
+    H = min(s.shape[0] for s in slices)
+    print(f"\nSeed-stability ({len(slices)} runs)  D_anchor={D}  hidden={H}")
+    print(f"  metric = 1-|cos|; lower = more stable; "
+          f"threshold for 'recovered' = {dist_threshold}")
+
+    anchored_all, free_all = [], []
     for i in range(len(slices)):
         for j in range(i + 1, len(slices)):
-            d = atom_distance(slices[i], slices[j])
-            print(f"  run {i} <-> run {j}: {d:.4f}")
+            da = direct_row_distance(slices[i][:D], slices[j][:D])
+            df = (atom_distances_vector(slices[i][D:], slices[j][D:])
+                  if H > D else np.array([]))
+            anchored_all.append(da)
+            if df.size:
+                free_all.append(df)
+            print(f"  run {i}<->{j}:  "
+                  f"anchored(direct) mean={da.mean():.4f} med={np.median(da):.4f} "
+                  f"| frac<{dist_threshold}={ (da<dist_threshold).mean():.2f}"
+                  + (f"   free(matched) mean={df.mean():.4f} "
+                     f"frac<{dist_threshold}={(df<dist_threshold).mean():.2f}"
+                     if df.size else ""))
 
-
+    a = np.concatenate(anchored_all) if anchored_all else np.array([])
+    f = np.concatenate(free_all) if free_all else np.array([])
+    print(f"\n  POOLED anchored: mean={a.mean():.4f}  median={np.median(a):.4f}  "
+          f"recovered={ (a<dist_threshold).mean()*100:.0f}%")
+    if f.size:
+        print(f"  POOLED free    : mean={f.mean():.4f}  median={np.median(f):.4f}  "
+              f"recovered={ (f<dist_threshold).mean()*100:.0f}%")
+        ratio = a.mean() / max(f.mean(), 1e-8)
+        print(f"\n  anchored/free mean ratio = {ratio:.3f}")
+        if a.mean() < dist_threshold and ratio < 0.5:
+            print("  --> CONSTRUCTIVE: anchored block is stable AND clearly "
+                  "more stable than free -> the anchor causes it.")
+        elif a.mean() >= dist_threshold:
+            print("  --> anchored block did NOT stabilise -> raise "
+                  "--lambda_anchor (or D exceeds usable S_B rank).")
+        else:
+            print("  --> anchored stable but free comparably so -> stability "
+                  "may be global, not anchor-caused; investigate.")
+    # optional: np.save('anchored_dists.npy', a); np.save('free_dists.npy', f)
+    # then histogram for the paper figure (bimodality test).
 # ==========================================
 # Main
 # ==========================================
@@ -231,6 +295,10 @@ def main():
     ap.add_argument('--data_seed', type=int, default=DEFAULT_DATA_SEED)
     ap.add_argument('--model_seed', type=int, default=DEFAULT_MODEL_SEED)
     ap.add_argument('--model_suffix', type=str, default='')
+    ap.add_argument('--anchor_metric', type=str, default='cosine',
+                    choices=['cosine', 'l2'],
+                    help="'cosine': pin direction only (recommended). "
+                         "'l2': pin direction+magnitude (original).")
     args = ap.parse_args()
 
     if args.batch_size is None:
@@ -345,8 +413,7 @@ def main():
             l_lat = lat_loss(z)
             l_tv = tv_loss(z)
             l_gc = gc_loss(z, GC)
-            l_anchor = anchor_loss(model, W0, args.anchor_mode)
-
+            l_anchor = anchor_loss(model, W0, args.anchor_mode, args.anchor_metric)
             loss = (l_recon
                     + LAMBDA_L1 * l_l1
                     + LAMBDA_LAT * l_lat

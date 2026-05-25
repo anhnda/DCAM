@@ -1,3 +1,10 @@
+python csae_sb_anchor.py \
+  --cache_dir cache_activations \
+  --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
+  --num_classes 1000 --D 256 --pool none \
+  --verify_seeds 0 1 2 --device cuda \
+  --save csae_sb_anchor_W0.npy
+
 python csae_svd_anchor.py \
     --cache_dir cache_activations \
     --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
