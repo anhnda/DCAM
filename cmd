@@ -1,4 +1,4 @@
-python eval_unified_cam.py --model resnet50 --class_id 207 \
+python eval_unified_cam.py --model resnet50 --class_id 10 \
     --methods grad_cam eigen_cam dcam \
     --lambda_sweep 0.0 0.25 0.5 0.75 1.0 \
     --bandwidth_sweep 0.4 0.8 1.6 \
