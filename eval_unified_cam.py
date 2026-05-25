@@ -365,6 +365,58 @@ def paired_bootstrap_delta(a: np.ndarray, b: np.ndarray, n_boot: int = 5000,
 
 
 # ==========================================================================
+# 3b. no-box sanity controls: random map (floor) + negated map (sign check)
+# ==========================================================================
+
+def random_saliency(H: int, W: int, seed: int) -> torch.Tensor:
+    """A uniform-random [H,W] map. Its deletion/insertion AUC is the FLOOR:
+    if a method's insertion AUC is not well above this, the causal metric is
+    not resolving signal and no 'better' claim off it means anything. We seed
+    per (image, draw) so the floor is reproducible."""
+    g = torch.Generator().manual_seed(seed)
+    return _unit_normalize(torch.rand(H, W, generator=g))
+
+
+def build_method_specs(args) -> List[Tuple[str, str, Optional[float],
+                                           Optional[float]]]:
+    """Assemble (label, corner, lam, bw) specs.
+
+    The corners are REFERENCE POINTS pinned on the same axes as the swept
+    interior -- they are not competitors to beat (they are settings of the same
+    objective) but anchors that tell you whether the interior moved the metric
+    at all relative to lambda=0 (Eigen/CRAFT) and lambda=1 (Grad-CAM/DCAM).
+
+    Sweep modes (in priority order):
+      * full 2D grid  : --lambda_sweep crossed with --bandwidth_sweep
+      * 1D bandwidth  : --bandwidth_sweep at a single --fixed_lambda
+      * 1D lambda     : --lambda_sweep at the single --bandwidth
+      * corners only  : neither sweep set -> just --methods
+    """
+    specs: List[Tuple[str, str, Optional[float], Optional[float]]] = []
+
+    # corners always included as reference anchors (dedup against sweeps later)
+    for m in args.methods:
+        specs.append((m, m, None, None))
+
+    lam_sweep = args.lambda_sweep
+    bw_sweep = args.bandwidth_sweep
+
+    if lam_sweep and bw_sweep:
+        for lam in lam_sweep:
+            for bw in bw_sweep:
+                specs.append((f"int_l{lam:g}_h{bw:g}", "new_interior", lam, bw))
+    elif bw_sweep:
+        lam = args.fixed_lambda
+        for bw in bw_sweep:
+            specs.append((f"int_l{lam:g}_h{bw:g}", "new_interior", lam, bw))
+    elif lam_sweep:
+        bw = args.bandwidth
+        for lam in lam_sweep:
+            specs.append((f"int_l{lam:g}_h{bw:g}", "new_interior", lam, bw))
+    return specs
+
+
+# ==========================================================================
 # 4. the protocol
 # ==========================================================================
 
@@ -381,6 +433,9 @@ class PerImageRow:
     eigengap: float
     seed_invariant: bool
     spatial_cos: float
+    lam_value: Optional[float] = None
+    bw_value: Optional[float] = None
+    is_control: bool = False
 
 
 def run_protocol(args) -> None:
@@ -394,12 +449,9 @@ def run_protocol(args) -> None:
     acts_norm, alpha_bank, index = build_bank(
         backbone, test_meta, bank_classes, args.bank_per_class)
 
-    # which methods? either explicit corners, or a lambda sweep (interior dial)
-    if args.lambda_sweep:
-        method_specs = [(f"lambda={lam:g}", "new_interior", lam)
-                        for lam in args.lambda_sweep]
-    else:
-        method_specs = [(m, m, None) for m in args.methods]
+    # ---- build the method specs: corners (reference points) + interior sweep
+    # spec tuple = (label, corner_name, lam_override or None, bw_override or None)
+    method_specs = build_method_specs(args)
 
     # ground-truth boxes available?
     bbox_root = Path(args.bbox_root) if args.bbox_root else None
@@ -444,11 +496,11 @@ def run_protocol(args) -> None:
             if boxes is not None:
                 gt_mask = boxes_to_224_mask(boxes, img.width, img.height)
 
-        for (label, corner, lam) in method_specs:
+        for (label, corner, lam, bw) in method_specs:
             sal_hw, diag = saliency_for_corner(
                 backbone, acts_use, alpha_use, query_idx,
                 A_query_norm, alpha_query, corner, args.D, lam,
-                args.bandwidth, args.n_restarts)
+                bw if bw is not None else args.bandwidth, args.n_restarts)
             sal_224 = upsample_map(sal_hw, 224)
 
             causal = deletion_insertion_auc(
@@ -472,7 +524,31 @@ def run_protocol(args) -> None:
                 pointing_hit=pg, iou=iou,
                 eigengap=diag["eigengap"],
                 seed_invariant=diag["seed_invariant"],
-                spatial_cos=diag["spatial_cos"]))
+                spatial_cos=diag["spatial_cos"],
+                lam_value=lam, bw_value=bw))
+
+        # ---- no-box sanity controls: random map (floor) + negated best map ----
+        if not args.no_controls:
+            H, W = A_query_norm.shape[-2], A_query_norm.shape[-1]
+            # random floor (averaged over a few draws to stabilise the estimate)
+            for d in range(args.n_random_draws):
+                rmap = upsample_map(random_saliency(H, W, seed=local_idx * 97 + d),
+                                    224)
+                rc = deletion_insertion_auc(
+                    backbone, x_pre, rmap, args.class_id,
+                    n_steps=args.n_steps, blur_sigma=args.blur_sigma)
+                rcs = comprehensiveness_sufficiency(
+                    backbone, x_pre, rmap, args.class_id,
+                    top_frac=args.top_frac, blur_sigma=args.blur_sigma)
+                rows.append(PerImageRow(
+                    image_idx=local_idx, method="__random__",
+                    deletion_auc=rc["deletion_auc"],
+                    insertion_auc=rc["insertion_auc"],
+                    comprehensiveness=rcs["comprehensiveness"],
+                    sufficiency=rcs["sufficiency"],
+                    pointing_hit=None, iou=None,
+                    eigengap=float("nan"), seed_invariant=False,
+                    spatial_cos=float("nan"), is_control=True))
 
         print(f"  scored image {local_idx}  "
               f"({len([r for r in rows if r.image_idx == local_idx])} methods)")
@@ -483,89 +559,163 @@ def run_protocol(args) -> None:
 def _summarize(rows: List[PerImageRow], method_specs, do_loc: bool, args):
     labels = [s[0] for s in method_specs]
 
-    def col(method, attr):
-        return np.asarray([getattr(r, attr) for r in rows
-                           if r.method == method and getattr(r, attr) is not None],
-                          dtype=float)
+    def col(method, attr, paired_with=None):
+        """Per-image values for `method`. If paired_with is given, return only
+        images present in BOTH, in matched image order, so paired_bootstrap
+        compares like with like."""
+        rs = {r.image_idx: getattr(r, attr) for r in rows
+              if r.method == method and getattr(r, attr) is not None
+              and not (isinstance(getattr(r, attr), float)
+                       and np.isnan(getattr(r, attr)))}
+        if paired_with is None:
+            return np.asarray(list(rs.values()), dtype=float)
+        os_ = {r.image_idx for r in rows if r.method == paired_with}
+        keys = sorted(k for k in rs if k in os_)
+        return np.asarray([rs[k] for k in keys], dtype=float)
 
-    print("\n" + "=" * 78)
-    print("PER-METHOD MEANS  (matched D=%d, matched perturbation, matched layer)"
+    # ---- the random floor (averaged over draws per image) ----
+    floor_del = col("__random__", "deletion_auc")
+    floor_ins = col("__random__", "insertion_auc")
+    have_floor = floor_ins.size > 0
+
+    print("\n" + "=" * 82)
+    print("PER-METHOD MEANS  (matched D=%d, matched perturbation grid, matched layer)"
           % args.D)
-    print("=" * 78)
-    header = (f"{'method':<16}{'del_auc↓':>10}{'ins_auc↑':>10}"
-              f"{'comp↑':>9}{'suff↓':>9}{'point↑':>9}{'iou↑':>8}"
-              f"{'eigengap':>11}")
+    print("=" * 82)
+    header = (f"{'method':<18}{'del_auc↓':>10}{'ins_auc↑':>10}"
+              f"{'comp↑':>9}{'suff↓':>9}{'eigengap':>11}{'seedOK':>8}")
     print(header)
     print("-" * len(header))
+    if have_floor:
+        print(f"{'__random__(floor)':<18}{floor_del.mean():>10.4f}"
+              f"{floor_ins.mean():>10.4f}"
+              f"{col('__random__','comprehensiveness').mean():>9.4f}"
+              f"{col('__random__','sufficiency').mean():>9.4f}"
+              f"{'--':>11}{'--':>8}")
     for m in labels:
         da = col(m, "deletion_auc"); ia = col(m, "insertion_auc")
         cp = col(m, "comprehensiveness"); su = col(m, "sufficiency")
-        pg = col(m, "pointing_hit"); io = col(m, "iou")
         eg = col(m, "eigengap")
-        pg_s = f"{pg.mean():.3f}" if pg.size else "  --"
-        io_s = f"{io.mean():.3f}" if io.size else "  --"
-        print(f"{m:<16}{da.mean():>10.4f}{ia.mean():>10.4f}"
-              f"{cp.mean():>9.4f}{su.mean():>9.4f}{pg_s:>9}{io_s:>8}"
-              f"{eg.mean():>11.2e}")
+        si = np.asarray([1.0 if r.seed_invariant else 0.0 for r in rows
+                         if r.method == m], dtype=float)
+        eg_s = f"{eg.mean():.2e}" if eg.size else "  --"
+        si_s = f"{si.mean():.2f}" if si.size else "  --"
+        print(f"{m:<18}{da.mean():>10.4f}{ia.mean():>10.4f}"
+              f"{cp.mean():>9.4f}{su.mean():>9.4f}{eg_s:>11}{si_s:>8}")
 
-    # ---- the verdict: interior vs the strongest corner, on the HELD-OUT axis
-    interior = [m for m in labels if "interior" in m or "lambda" in m]
-    corners = [m for m in labels if m not in interior]
-    print("\n" + "=" * 78)
-    print("VERDICT  (paired bootstrap, interior - corner; CI excluding 0 = sig.)")
-    print("=" * 78)
+    # ---- floor check: is the metric even resolving signal? ----
+    print("\n" + "=" * 82)
+    print("FLOOR CHECK  (causal axis is meaningless if methods ≈ random)")
+    print("=" * 82)
+    if not have_floor:
+        print("  controls disabled (--no_controls): no floor. The absolute "
+              "AUC numbers\n  above are uninterpretable without it.")
+    else:
+        interior_all = [m for m in labels if m.startswith("int_")]
+        ref = interior_all or [m for m in labels if m not in ("__random__",)]
+        best_ins = max(ref, key=lambda m: col(m, "insertion_auc").mean()) \
+            if ref else None
+        if best_ins:
+            a = col(best_ins, "insertion_auc", paired_with="__random__")
+            b = col("__random__", "insertion_auc", paired_with=best_ins)
+            n = min(a.size, b.size)
+            if n > 0:
+                bs = paired_bootstrap_delta(a[:n], b[:n])
+                verdict = ("ABOVE floor (metric resolves signal)"
+                           if bs["significant"] and bs["mean_delta"] > 0
+                           else "NOT above floor -- metric is NOT resolving "
+                                "signal; do not interpret any AUC delta")
+                print(f"  best method '{best_ins}' insertion AUC vs random: "
+                      f"Δ={bs['mean_delta']:+.4f} "
+                      f"CI[{bs['ci_lo']:+.4f},{bs['ci_hi']:+.4f}]  -> {verdict}")
+
+    # ---- interior characterization across the cube (NOT a victory claim) ----
+    interior = [m for m in labels if m.startswith("int_")]
+    corners = [m for m in labels if not m.startswith("int_")
+               and m != "__random__"]
+    print("\n" + "=" * 82)
+    print("CAUSAL-AXIS CHARACTERIZATION  (no boxes: this is an ablation, not a "
+          "'better' claim)")
+    print("=" * 82)
     if not interior:
-        print("  no interior method in the run; nothing to certify.")
-        return
+        print("  no interior sweep points; ran corners only. Nothing to "
+              "characterize across (λ,h).")
+    else:
+        # rank interior points by insertion AUC, but GATE on a positive eigengap:
+        # a causal 'win' at a collapsed eigengap is on a non-unique subspace and
+        # is not a real result (paper section 4).
+        def gated_score(m):
+            eg = col(m, "eigengap")
+            ins = col(m, "insertion_auc")
+            if eg.size and eg.mean() <= args.eigengap_floor:
+                return -np.inf  # disqualified: subspace not unique
+            return ins.mean() if ins.size else -np.inf
 
-    # pick the interior point and the best corner to compare against
-    target = interior[-1] if not args.lambda_sweep else \
-        max(interior, key=lambda m: col(m, "iou").mean()
-            if do_loc and col(m, "iou").size else col(m, "insertion_auc").mean())
+        ranked = sorted(interior, key=gated_score, reverse=True)
+        best = ranked[0]
+        best_eg = col(best, "eigengap").mean() if col(best, "eigengap").size else float("nan")
+        if gated_score(best) == -np.inf:
+            print("  every interior point either has no eigengap above the floor "
+                  f"({args.eigengap_floor:g}) or no data.\n  No (λ,h) point "
+                  "qualifies as a stable subspace -- report this as a NEGATIVE "
+                  "result, honestly.")
+        else:
+            print(f"  best interior (λ,h) on insertion AUC, AMONG points with "
+                  f"eigengap>{args.eigengap_floor:g}: {best}")
+            print(f"    eigengap there = {best_eg:.2e}  (subspace is unique -> "
+                  "the point is interpretable)")
+            # contrast that point against each corner reference, paired
+            for c in corners:
+                for attr, better in [("insertion_auc", "higher"),
+                                     ("deletion_auc", "lower")]:
+                    a = col(best, attr, paired_with=c)
+                    b = col(c, attr, paired_with=best)
+                    n = min(a.size, b.size)
+                    if n == 0:
+                        continue
+                    sign = 1.0 if better == "higher" else -1.0
+                    bs = paired_bootstrap_delta(sign * a[:n], sign * b[:n])
+                    tag = ("interior↑" if bs["significant"] and bs["mean_delta"] > 0
+                           else "interior↓" if bs["significant"]
+                           and bs["mean_delta"] < 0 else "tie")
+                    print(f"    [{attr}] {best} vs corner {c}: "
+                          f"Δ={bs['mean_delta']:+.4f} "
+                          f"CI[{bs['ci_lo']:+.4f},{bs['ci_hi']:+.4f}]  {tag}")
 
-    for verdict_attr, axis, better in [
-            ("iou", "HELD-OUT (localization IoU)", "higher"),
-            ("pointing_hit", "HELD-OUT (pointing game)", "higher"),
-            ("insertion_auc", "causal (insertion AUC)", "higher"),
-            ("deletion_auc", "causal (deletion AUC)", "lower")]:
-        a = col(target, verdict_attr)
-        if a.size == 0:
-            if "HELD-OUT" in axis:
-                print(f"  [{axis}] skipped -- no ground-truth boxes.")
-            continue
-        # compare against each corner; report the toughest (smallest |delta|)
-        for c in corners:
-            b = col(c, verdict_attr)
-            if b.size == 0 or b.size != a.size:
-                continue
-            # for 'lower is better' metrics flip the delta sign so >0 = win
-            sign = 1.0 if better == "higher" else -1.0
-            bs = paired_bootstrap_delta(sign * a, sign * b)
-            tag = "WIN" if (bs["significant"] and bs["mean_delta"] > 0) else (
-                  "LOSS" if (bs["significant"] and bs["mean_delta"] < 0)
-                  else "TIE")
-            star = "  <-- held-out verdict" if "HELD-OUT" in axis else ""
-            print(f"  [{axis}] {target} vs {c}: "
-                  f"Δ={bs['mean_delta']:+.4f} "
-                  f"CI[{bs['ci_lo']:+.4f},{bs['ci_hi']:+.4f}] "
-                  f"{tag}{star}")
-
-    print("\nHow to read this:")
-    print("  * A held-out WIN (localization) WHILE causal axis is TIE-or-WIN is")
-    print("    the defensible 'interior is better'. The interior earned a metric")
-    print("    it was not trained on.")
-    print("  * A causal-only WIN with a localization TIE/LOSS is the CONFOUND")
-    print("    showing through: you optimized class evidence and measured class")
-    print("    evidence. Do NOT claim 'better' on that alone.")
-    if not do_loc:
-        print("  * NOTE: localization axis was skipped -> only the weak causal")
-        print("    evidence is available. Treat any 'WIN' above as provisional.")
+    # ---- the honesty block, unconditional in this configuration ----
+    print("\n" + "!" * 82)
+    print("HOW TO REPORT THIS  (deletion/insertion only, no held-out axis)")
+    print("!" * 82)
+    print("  1. This is the CAUSAL axis ONLY. It is self-referential: the "
+          "interior basis is")
+    print("     tilted toward class evidence (λ>0), and insertion/deletion AUC "
+          "scores a map by")
+    print("     how the CLASS LOGIT moves. An interior 'interior↑' above is "
+          "therefore EXPECTED")
+    print("     and is WEAK evidence of faithfulness -- you optimized the "
+          "metric's own signal.")
+    print("  2. The defensible claims from THIS run are:")
+    print("       (a) the floor check -- methods resolve signal above random;")
+    print("       (b) the SHAPE of the (λ,h) surface -- the objective's dials "
+          "move the causal")
+    print("           metric monotonically/interpretably (an ablation result);")
+    print("       (c) corners are reproduced as reference points on that "
+          "surface.")
+    print("  3. To claim 'unified_cam is BETTER', you still need the HELD-OUT "
+          "axis (localization")
+    print("     vs boxes, or stability under perturbation). Re-run with "
+          "--bbox_root once you")
+    print("     have annotations; the harness will then print a held-out "
+          "verdict line.")
+    print("  4. Any interior point with eigengap ≤ %g was DISQUALIFIED above: "
+          "non-unique" % args.eigengap_floor)
+    print("     subspace = not seed-invariant = not a result (paper §4).")
 
     # dump raw rows for the paper's table / appendix
     out = Path(args.output_json)
     out.write_text(json.dumps([r.__dict__ for r in rows], indent=2))
-    print(f"\nPer-image rows written to {out}")
-    print("=" * 78)
+    print(f"\nPer-image rows (incl. controls) written to {out}")
+    print("=" * 82)
 
 
 def main():
@@ -583,11 +733,27 @@ def main():
                     help=f"corners to compare; choose from "
                          f"{list(CORNER_PRESETS)}")
     ap.add_argument('--lambda_sweep', type=float, nargs='+', default=None,
-                    help='If set, ignore --methods and sweep the interior '
-                         'supervision dial lambda (new_interior basis).')
+                    help='Sweep the interior supervision dial lambda. Crossed '
+                         'with --bandwidth_sweep if both are set (2D grid).')
+    ap.add_argument('--bandwidth_sweep', type=float, nargs='+', default=None,
+                    help='Sweep the locality bandwidth h. Crossed with '
+                         '--lambda_sweep (2D grid), or run at --fixed_lambda.')
+    ap.add_argument('--fixed_lambda', type=float, default=0.5,
+                    help='Lambda used for a bandwidth-only (1D) sweep.')
     ap.add_argument('--D', type=int, default=50)
-    ap.add_argument('--bandwidth', type=float, default=0.8)
+    ap.add_argument('--bandwidth', type=float, default=0.8,
+                    help='Default h for corners / lambda-only sweep.')
     ap.add_argument('--n_restarts', type=int, default=1)
+    # no-box sanity controls
+    ap.add_argument('--no_controls', action='store_true',
+                    help='Disable the random-map floor. NOT recommended: '
+                         'without it the absolute AUCs are uninterpretable.')
+    ap.add_argument('--n_random_draws', type=int, default=3,
+                    help='Random-map draws per image for the floor estimate.')
+    ap.add_argument('--eigengap_floor', type=float, default=1e-8,
+                    help='Interior (λ,h) points with mean eigengap at or below '
+                         'this are DISQUALIFIED from the win ranking (non-'
+                         'unique subspace = not seed-invariant, paper §4).')
     # perturbation schedule (shared across methods)
     ap.add_argument('--n_steps', type=int, default=50)
     ap.add_argument('--blur_sigma', type=float, default=11.0)

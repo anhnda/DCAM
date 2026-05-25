@@ -1,9 +1,14 @@
+python eval_unified_cam.py --model resnet50 --class_id 207 \
+    --methods grad_cam eigen_cam dcam \
+    --lambda_sweep 0.0 0.25 0.5 0.75 1.0 \
+    --bandwidth_sweep 0.4 0.8 1.6 \
+    --D 50 --n_images 50
 python csae_pca_baseline.py --cache_dir cache_activations \
   --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
   --D 0 --device cuda --save pca_baseline_resnet50_D0_model.pkl
 
-python check_drop_csae_fixed.py --model resnet50 \
-  --csae_model pca_baseline_resnet50_D0_model.pkl \
+python check_drop_csae_fixed.py --model efficientnet \
+  --csae_model pca_baseline_efficientnet_D200_model.pkl \
   --norm_mode per_batch --debug_batches 3
 
 python csae_pca_baseline.py \
