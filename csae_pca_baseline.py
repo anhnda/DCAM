@@ -185,7 +185,8 @@ def build_pca_reconstructor(cache_path: Path, D: int,
     # where does cumulative variance hit common thresholds?
     cum = torch.cumsum(w, dim=0) / max(total_var, 1e-12)
     for thr in (0.90, 0.95, 0.99):
-        k = int(torch.searchsorted(cum, torch.tensor(thr, dtype=cum.dtype)).item()) + 1
+        k = int(torch.searchsorted(
+            cum, torch.tensor(thr, dtype=cum.dtype, device=cum.device)).item()) + 1
         print(f"    {int(thr*100)}% variance reached at rank {k}")
     print(f"{'='*64}")
 

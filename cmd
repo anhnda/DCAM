@@ -1,3 +1,9 @@
+python csae_pca_baseline.py \
+  --cache_dir cache_activations \
+  --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
+  --D 200 --device cuda \
+  --save pca_baseline_resnet50_D200_model.pkl
+
 python csae_sb_anchor.py \
   --cache_dir cache_activations \
   --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
