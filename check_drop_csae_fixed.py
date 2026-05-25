@@ -65,7 +65,7 @@ from full_classes import IMAGENET2012_CLASSES
 
 import pandas as pd
 import random
-
+from csae_pca_baseline import PCAReconstructor   # noqa: F401  (needed for unpickling)
 
 MODEL_CONFIGS = {
     'resnet50': {'model_fn': lambda: models.resnet50(pretrained=True),
