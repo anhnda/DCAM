@@ -1,3 +1,6 @@
+python df_decomposition.py --model resnet50 --target_layer layer3 --basis kernel --D 200
+python df_hier_visualization.py --image cat.jpg --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
+
 python eval_unified_cam.py --model resnet50 --class_id 10 \
     --methods grad_cam eigen_cam dcam \
     --lambda_sweep 0.0 0.25 0.5 0.75 1.0 \
