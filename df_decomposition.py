@@ -31,11 +31,18 @@ Three weight-derived bases are provided (Definition 1 + Section 5):
 
   'kernel'   top-D left singular subspace of W            -> WW^T
              the white-input surrogate H_in = I  (Observation 2).
-  'bn'       top-D eigenspace of  W diag(h_hat) W^T        -> BN-tilted
-             h_hat = upstream BatchNorm running variances feeding the branch.
+  'bn'       top-D eigenspace of  W diag(h_in) W^T         -> BN-tilted
+             h_in = UPSTREAM BatchNorm running variances on the INPUT-patch
+             axis (the BN feeding conv3 -- bn2 in a bottleneck). This is the
+             diagonal proxy for H_in in Sigma = W H_in W^T (Definition 1).
   'distill'  top-D eigenspace of Sigma~ estimated from a BatchNorm-matched
              synthetic batch run through the true nonlinear forward pass
              (Section 5, ZeroQ-style). Zero real images.
+
+  The three form a ladder on the assumed input covariance:
+      kernel  : H_in = I              (white)
+      bn      : H_in = diag(h_in)     (diagonal input anisotropy, FREE)
+      distill : H_in = full           (off-diagonals too, via synthesis)
 
 Theorem 2: 'kernel' and 'bn' are deterministic functions of the checkpoint --
 seed-, ordering-, and corpus-invariant. 'distill' depends only on the synthesis
@@ -51,12 +58,27 @@ Usage
   python df_decomposition.py --model resnet50 --target_layer layer3 \\
       --basis kernel --D 200 --output df_basis_resnet50_layer3_kernel.pkl
 
+  # BN-tilted variant (input-axis upstream-BN tilt; still zero data)
+  python df_decomposition.py --model resnet50 --target_layer layer3 \\
+      --basis bn --D 200 --output df_basis_resnet50_layer3_bn.pkl
+
   # BN-distilled variant (synthesises images, still zero real data)
   python df_decomposition.py --model resnet50 --target_layer layer3 \\
       --basis distill --D 200 --distill_batches 8 --distill_iters 500 \\
       --output df_basis_resnet50_layer3_distill.pkl
 
   # then visualize a single image with df_hier_visualization.py
+
+CHANGELOG (vs prior revision)
+-----------------------------
+  * build_bn_basis now tilts the INPUT axis (columns of W) by the UPSTREAM
+    BN variance, matching Definition 1 ("upstream BatchNorm running variances
+    feeding the branch"). The prior revision tilted the OUTPUT axis by bn3's
+    variance, then undid the scaling and re-QR'd -- a near-identity no-op that
+    left the 'bn' basis indistinguishable from 'kernel'. Eigenvectors of the
+    symmetric PSD  W diag(h_in) W^T  are already orthonormal, so no undo / QR
+    is needed.
+  * Added get_upstream_bn_var() to locate the BN feeding the folded operator.
 """
 
 import argparse
@@ -215,22 +237,21 @@ def get_effective_operator(backbone: nn.Module, model_name: str,
 
 
 # ======================================================================
-# BatchNorm mean / variance read-off  (offset mu; BN-tilt for 'bn' basis)
+# BatchNorm mean read-off  (offset mu)
 # ======================================================================
 
 def get_bn_stats(backbone: nn.Module, model_name: str,
                  target_layer_name: str, C_out: int
-                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Read the BatchNorm running statistics that describe the target layer's
-    OUTPUT channels.
+                 ) -> torch.Tensor:
+    """Read the BatchNorm running MEAN that describes the target layer's
+    OUTPUT channels -- used as the offset mu (Section B, a proxy for the
+    post-activation channel mean). Theorem 1 holds for any mu; the proxy
+    only repartitions mass between offset and components.
 
-    mu (offset)       : BN running mean of the operator we folded (Section B,
-                        a proxy for the post-activation channel mean).
-    h_hat (BN tilt)   : BN running variance of the same channels, used by the
-                        'bn' basis to weight WW^T by per-channel scale
-                        (Definition 1, BN-tilted variant).
+    (The OUTPUT-channel running VARIANCE is intentionally NOT returned here:
+    the previous revision used it as the 'bn' tilt, on the wrong axis. The
+    'bn' tilt now uses the UPSTREAM/input variance -- see get_upstream_bn_var.)
     """
-    # device of the backbone -- all fallback tensors must match it.
     dev = next(backbone.parameters()).device
 
     if model_name in ('resnet50', 'resnet18'):
@@ -240,26 +261,69 @@ def get_bn_stats(backbone: nn.Module, model_name: str,
         last_block = stage[-1]
         bn_f = last_block.bn3 if hasattr(last_block, 'bn3') else last_block.bn2
         mu = bn_f.running_mean.detach().clone()
-        h_hat = bn_f.running_var.detach().clone()
     elif model_name == 'vgg16':
         idx = int(target_layer_name.split('[')[1].rstrip(']'))
         if idx + 1 < len(backbone.features) and isinstance(
                 backbone.features[idx + 1], nn.BatchNorm2d):
-            bn = backbone.features[idx + 1]
-            mu = bn.running_mean.detach().clone()
-            h_hat = bn.running_var.detach().clone()
+            mu = backbone.features[idx + 1].running_mean.detach().clone()
         else:
-            # plain VGG (no BN): BN proxy unavailable -> zero offset, unit tilt.
             mu = torch.zeros(C_out, device=dev)
-            h_hat = torch.ones(C_out, device=dev)
     else:
         raise ValueError(f"Unsupported model '{model_name}'.")
 
     if mu.numel() != C_out:
-        # defensive: fall back to zero offset of the right width
         mu = torch.zeros(C_out, device=dev)
-        h_hat = torch.ones(C_out, device=dev)
-    return mu, h_hat
+    return mu
+
+
+def get_upstream_bn_var(backbone: nn.Module, model_name: str,
+                        target_layer_name: str, in_dim: int) -> torch.Tensor:
+    """Running variance of the BN feeding the folded operator's INPUT.
+
+    This is Definition 1's "upstream BatchNorm running variances feeding the
+    branch" -- the per-input-channel scale on the INPUT-patch axis, used as a
+    diagonal proxy for H_in in  Sigma = W H_in W^T.
+
+    ResNet-50 bottleneck:  conv1->bn1->conv2->bn2->conv3->bn3.
+        The folded operator is conv3+bn3; conv3's input is bn2's output, so
+        the upstream variance is last_block.bn2.running_var  (length C_in of
+        conv3, i.e. the bottleneck width).
+    ResNet-18 BasicBlock:  conv1->bn1->conv2->bn2.
+        The folded operator is conv2+bn2; conv2's input is bn1's output, so
+        the upstream variance is last_block.bn1.running_var.
+    VGG / plain:  no reliable upstream BN on the conv input -> unit (white),
+        i.e. this collapses gracefully back to the 'kernel' surrogate.
+
+    The returned vector is broadcast to length `in_dim`. For a 1x1 conv3
+    (the ResNet-50 expand) in_dim == C_in exactly. For a kxk conv (VGG,
+    ResNet-18 conv2) in_dim == C_in * kh * kw and we tile the per-channel
+    variance across the kh*kw spatial taps (the BN variance is per channel,
+    shared across taps -- the honest diagonal proxy).
+    """
+    dev = next(backbone.parameters()).device
+
+    if model_name in ('resnet50', 'resnet18'):
+        stage = {'layer1': backbone.layer1, 'layer2': backbone.layer2,
+                 'layer3': backbone.layer3, 'layer4': backbone.layer4
+                 }[target_layer_name]
+        last_block = stage[-1]
+        if hasattr(last_block, 'conv3'):           # bottleneck: conv3 <- bn2
+            h_in_ch = last_block.bn2.running_var.detach().clone()
+        else:                                      # basicblock: conv2 <- bn1
+            h_in_ch = last_block.bn1.running_var.detach().clone()
+    else:
+        # VGG plain conv: no folded-in upstream BN on the conv input.
+        # White fallback => 'bn' reduces to 'kernel'.
+        return torch.ones(in_dim, device=dev)
+
+    C_in = h_in_ch.numel()
+    if in_dim == C_in:
+        return h_in_ch                              # 1x1 conv: exact
+    if in_dim % C_in == 0:
+        taps = in_dim // C_in                        # kxk conv: tile over taps
+        return h_in_ch.repeat_interleave(taps)
+    # shape mismatch we can't reconcile -> white fallback
+    return torch.ones(in_dim, device=dev)
 
 
 # ======================================================================
@@ -294,31 +358,30 @@ def build_kernel_basis(W: torch.Tensor, D: int) -> Tuple[torch.Tensor,
     return _topD_left_singular(W, D)
 
 
-def build_bn_basis(W: torch.Tensor, h_hat: torch.Tensor,
+def build_bn_basis(W: torch.Tensor, h_in: torch.Tensor,
                    D: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """BN-tilted basis (Definition 1): top-D eigenspace of W diag(h_hat) W^T.
+    """BN-tilted basis (Definition 1, corrected): top-D eigenspace of
+    W diag(h_in) W^T, with h_in the UPSTREAM BN running variances on the
+    INPUT-patch axis -- the diagonal proxy for H_in in  Sigma = W H_in W^T.
 
-    h_hat are the BatchNorm running variances of the operator's OUTPUT
-    channels; tilting WW^T by them is a cheap, corpus-free proxy for the
-    input-patch anisotropy H_in. Equivalently the top-D left singular vectors
-    of  diag(sqrt(h_hat)) ... -- we form it on the output side since h_hat
-    indexes output channels here.
+    The left singular vectors of  M = W diag(sqrt h_in)  are exactly the
+    eigenvectors of  M M^T = W diag(h_in) W^T, and are ALREADY orthonormal in
+    R^{C_out}. So -- unlike the previous (output-axis) revision -- there is no
+    undo-scaling step and no re-QR: tilting the input axis does not move the
+    frame off the channel space, it only re-orients within it.
+
+    Parameters
+    ----------
+    W     : [C_out, in_dim]   effective operator (columns index input patch).
+    h_in  : [in_dim]          upstream BN variances on the input axis.
     """
-    # Symmetric PSD matrix M = W W^T tilted by output-channel scale.
-    # We weight each *output* channel by its BN std: A_tilt = diag(sqrt h) W.
-    s = torch.sqrt(h_hat.clamp(min=1e-12))
-    M = s.view(-1, 1) * W                                   # [C_out, in_dim]
+    if h_in.shape[0] != W.shape[1]:
+        raise ValueError(f"h_in length {h_in.shape[0]} != W input dim "
+                         f"{W.shape[1]}; check get_upstream_bn_var.")
+    s_in = torch.sqrt(h_in.clamp(min=1e-12)).to(W.device)   # [in_dim]
+    M = W * s_in.view(1, -1)                                 # scale COLUMNS
     U_D, sv = _topD_left_singular(M, D)
-    # Undo the output-side scaling so vectors live in the un-tilted channel
-    # space, then re-orthonormalise (Gram-Schmidt via QR) to keep the frame
-    # orthonormal -- completeness (Theorem 1) requires orthonormality.
-    U_D = U_D / s.clamp(min=1e-12).view(-1, 1)
-    Q, _ = torch.linalg.qr(U_D)
-    for d in range(Q.shape[1]):
-        col = Q[:, d]
-        if col[torch.argmax(col.abs())] < 0:
-            Q[:, d] = -col
-    return Q.contiguous(), sv
+    return U_D, sv
 
 
 def build_distill_basis(backbone: nn.Module, model_name: str,
@@ -509,7 +572,7 @@ def build_from_weights(model_name: str, target_layer_name: str, D: int,
     W, block_kind, winfo = get_effective_operator(
         backbone, model_name, target_layer_name)
     C_out = W.shape[0]
-    mu_bn, h_hat = get_bn_stats(backbone, model_name, target_layer_name, C_out)
+    mu_bn = get_bn_stats(backbone, model_name, target_layer_name, C_out)
 
     print(f"  Effective operator W: {tuple(W.shape)}  "
           f"(block kind: {block_kind})")
@@ -519,9 +582,15 @@ def build_from_weights(model_name: str, target_layer_name: str, D: int,
         mu = mu_bn
         meta = dict(winfo)
     elif basis == 'bn':
-        V, sv = build_bn_basis(W, h_hat, D)
+        h_in = get_upstream_bn_var(backbone, model_name,
+                                   target_layer_name, W.shape[1])
+        # diagnostic: how anisotropic is the diagonal proxy?
+        h_ratio = float(h_in.max() / h_in.clamp(min=1e-12).min())
+        print(f"  Upstream BN tilt h_in: len={h_in.numel()}  "
+              f"max/min ratio={h_ratio:.2f}  (1.0 == white == no tilt)")
+        V, sv = build_bn_basis(W, h_in, D)
         mu = mu_bn
-        meta = dict(winfo)
+        meta = dict(winfo); meta['h_in_ratio'] = h_ratio
     elif basis == 'distill':
         V, mu_d, dinfo = build_distill_basis(
             backbone, model_name, target_layer_name, C_out, D,
@@ -576,7 +645,8 @@ def main():
     ap.add_argument('--basis', type=str, default='kernel',
                     choices=['kernel', 'bn', 'distill'],
                     help="kernel = WW^T white surrogate; "
-                         "bn = BN-tilted; distill = ZeroQ-style synthesis.")
+                         "bn = input-axis upstream-BN tilt; "
+                         "distill = ZeroQ-style synthesis.")
     ap.add_argument('--D', type=int, default=200,
                     help='Number of basis components to keep.')
     ap.add_argument('--distill_batches', type=int, default=8)
