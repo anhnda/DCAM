@@ -386,57 +386,61 @@ def build_bn_basis(W: torch.Tensor, h_in: torch.Tensor,
 
 def build_distill_basis(backbone: nn.Module, model_name: str,
                         target_layer_name: str, C_out: int, D: int,
-                        n_batches: int = 1, batch_size: int = 64,
-                        iters: int = 200, lr: float = 0.1,
+                        n_batches: int = 2, batch_size: int = 32,
+                        iters: int = 400, lr: float = 0.1,
                         device: torch.device = torch.device('cpu'),
                         seed: int = 0,
                         bn_stride: int = 1,
-                        use_amp: bool = True) -> Tuple[torch.Tensor,
+                        use_amp: bool = True,
+                        harvest_passes: int = 8,
+                        harvest_bs: int = 64) -> Tuple[torch.Tensor,
                                                        torch.Tensor, Dict]:
-    """ZeroQ-style BN-distilled basis (Section 5), faster.
+    """ZeroQ-style BN-distilled basis, decoupled synthesis vs harvest.
 
-    Changes vs the prior revision (all wall-time, none semantic):
-      * Pre-stacks BN target (mean, var) tensors per layer so the inner loop
-        is two big MSEs instead of ~53 small ones (cuts kernel launches ~50x).
-      * Optional `bn_stride`: hook only every k-th BN. Empirically k=2-4 gives
-        nearly identical Sigma~ at a fraction of the per-step Python cost.
-      * AMP (mixed precision) on the synthesis forward/backward.
-      * Cosine LR + halved default iters (200) -- BN-matching converges fast.
-      * Default to a single bigger batch (64) instead of 8 small ones (16):
-        same total images, one optimisation, more cells per Sigma~ accumulator
-        round.
-      * Hooks are still per-step (BN stats are batch-dependent, not running),
-        but write into a pre-allocated list, not a dict.
-      * Covariance accumulation uses float64 to keep Sigma~ well conditioned
-        even though synthesis runs in fp16.
+    Key insight: synthesis is the expensive part (forward+backward+optimizer);
+    cell harvest is just forwards. Past revisions tied them 1:1 -- every
+    optimizer round produced exactly one harvest pass. That made the only
+    knob for "more cells" (which is what Sigma~ actually needs) also a knob
+    for "more synthesis" (which it doesn't).
+
+    Now:
+      * n_batches synthesis rounds produce n_batches distinct image sets
+      * each set is harvested `harvest_passes` times with random crops + flips
+        through the forward path (no backward, no optimizer) at `harvest_bs`
+      * total cells per round = harvest_passes * harvest_bs * H * W
+        e.g. 8 * 64 * 14 * 14 = 100k cells from ONE synthesis round
+      * compare to old code's 16 * 14 * 14 = 3136 cells per round
+
+    Sensible budgets:
+      * fast, decent Sigma~ : n_batches=1, iters=300, harvest_passes=4
+      * thorough            : n_batches=2, iters=400, harvest_passes=8
+
+    Other speed changes carried over from the previous patch:
+      * freeze backbone params (no autograd graph for ~25M weights)
+      * AMP synthesis with fp32 BN-stat reduction
+      * cosine LR
+      * pre-allocated hook slots (no dict churn)
+      * fp64 covariance accumulators
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
     backbone = backbone.to(device).eval()
     for p in backbone.parameters():
-        p.requires_grad_(False)   # we only differentiate wrt x
+        p.requires_grad_(False)
 
-    # ---- select BNs to match (optionally strided) ----
+    # ---- BN match setup ----
     all_bns = [m for m in backbone.modules() if isinstance(m, nn.BatchNorm2d)]
     bn_layers = all_bns[::bn_stride] if bn_stride > 1 else all_bns
     n_bn = len(bn_layers)
-
-    # pre-stack targets so the loss is two whole-tensor MSEs
-    # (all BN layers have different channel counts -> keep as list of tensors,
-    # but at least skip the per-iter .detach()/.to() churn)
     bn_mean_targets = [bn.running_mean.detach().to(device) for bn in bn_layers]
     bn_var_targets  = [bn.running_var.detach().to(device)  for bn in bn_layers]
 
-    # slot per layer; overwritten each step (no dict churn / clear())
     bn_feats_mean: list = [None] * n_bn
     bn_feats_var:  list = [None] * n_bn
 
     def make_hook(i):
         def hook(module, inp, out):
-            x = inp[0]
-            # fp32 reduction even under AMP -- BN stats are tiny and we want
-            # them stable for the loss
-            xf = x.float()
+            xf = inp[0].float()
             bn_feats_mean[i] = xf.mean(dim=(0, 2, 3))
             bn_feats_var[i]  = xf.var(dim=(0, 2, 3), unbiased=False)
         return hook
@@ -458,7 +462,6 @@ def build_distill_basis(backbone: nn.Module, model_name: str,
         collected['act'] = out.detach()
     tgt_handle = target_module.register_forward_hook(tgt_hook)
 
-    # ---- accumulators in fp64 for numerical safety ----
     cell_sum = torch.zeros(C_out, device=device, dtype=torch.float64)
     cell_cov = torch.zeros(C_out, C_out, device=device, dtype=torch.float64)
     n_cells = 0
@@ -466,7 +469,13 @@ def build_distill_basis(backbone: nn.Module, model_name: str,
     amp_enabled = use_amp and device.type == 'cuda'
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
+    import time
+    t_synth_total = 0.0
+    t_harvest_total = 0.0
+
     for batch in range(n_batches):
+        # =============== SYNTHESIS ===============
+        t0 = time.time()
         x = torch.randn(batch_size, 3, 224, 224, device=device,
                         requires_grad=True)
         opt = torch.optim.Adam([x], lr=lr)
@@ -476,7 +485,6 @@ def build_distill_basis(backbone: nn.Module, model_name: str,
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 _ = backbone(x)
-                # build loss in fp32 (hooks already cast)
                 loss = x.new_zeros((), dtype=torch.float32)
                 for i in range(n_bn):
                     if bn_feats_mean[i] is None:
@@ -493,22 +501,51 @@ def build_distill_basis(backbone: nn.Module, model_name: str,
                 loss.backward()
                 opt.step()
             sched.step()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_synth = time.time() - t0
+        t_synth_total += t_synth
 
-        # ---- harvest cells from this batch ----
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_enabled):
-            _ = backbone(x.detach())
-            act = collected['act'].float()           # [B, C, H, W] in fp32
-            cells = act.permute(0, 2, 3, 1).reshape(-1, C_out).double()
-            cell_sum += cells.sum(dim=0)
-            cell_cov += cells.T @ cells
-            n_cells += cells.shape[0]
+        # =============== HARVEST ===============
+        # Many forward passes through the synthesised images, with light
+        # augmentation (flip + random crop within the 224 frame), to extract
+        # many cells without paying for more optimisation.
+        t0 = time.time()
+        x_pool = x.detach()
+        with torch.no_grad():
+            for hp in range(harvest_passes):
+                # sample harvest_bs images (with replacement if needed) and
+                # apply hflip
+                if harvest_bs <= batch_size:
+                    idx_pool = torch.randperm(batch_size, device=device)[:harvest_bs]
+                else:
+                    idx_pool = torch.randint(0, batch_size, (harvest_bs,),
+                                             device=device)
+                xh = x_pool[idx_pool]
+                if torch.rand(()) < 0.5:
+                    xh = torch.flip(xh, dims=[3])
+                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                    _ = backbone(xh)
+                act = collected['act'].float()
+                cells = act.permute(0, 2, 3, 1).reshape(-1, C_out).double()
+                cell_sum += cells.sum(dim=0)
+                cell_cov += cells.T @ cells
+                n_cells += cells.shape[0]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_harvest = time.time() - t0
+        t_harvest_total += t_harvest
 
         print(f"  [distill] batch {batch + 1}/{n_batches}  "
-              f"final bn-match loss={float(loss):.4f}  cells={n_cells}")
+              f"synth={t_synth:.1f}s  harvest={t_harvest:.1f}s  "
+              f"cells={n_cells}  final bn-loss={float(loss):.4f}")
 
     for h in handles:
         h.remove()
     tgt_handle.remove()
+
+    print(f"  [distill] totals: synth={t_synth_total:.1f}s  "
+          f"harvest={t_harvest_total:.1f}s  cells={n_cells}")
 
     mu_distill = (cell_sum / max(n_cells, 1)).float()
     Sigma = (cell_cov / max(n_cells, 1)).float() \
@@ -526,7 +563,9 @@ def build_distill_basis(backbone: nn.Module, model_name: str,
 
     info = {'n_cells': n_cells, 'n_batches': n_batches,
             'batch_size': batch_size, 'iters': iters,
-            'bn_stride': bn_stride, 'amp': amp_enabled}
+            'harvest_passes': harvest_passes, 'harvest_bs': harvest_bs,
+            'bn_stride': bn_stride, 'amp': amp_enabled,
+            't_synth_s': t_synth_total, 't_harvest_s': t_harvest_total}
     return V.cpu(), mu_distill.cpu(), info
 
 
