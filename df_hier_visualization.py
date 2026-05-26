@@ -38,20 +38,32 @@ Layout (verbatim geometry from hier_visualize_pca.py)
 
 Prerequisite: a basis .pkl built by df_decomposition.py.
 
+Image source -- two mutually exclusive modes
+---------------------------------------------
+  (a) --image PATH            explain an arbitrary image file on disk.
+  (b) --class_id ID [--offset N]
+                              pull a cached ImageNet test image for that
+                              class from test_metadata.pkl, exactly as
+                              hier_visualize_pca.py does. Useful for
+                              reproducing the paper's per-class panels.
+
 Usage
 -----
+  # (a) arbitrary image file
   python df_hier_visualization.py --image cat.jpg \\
       --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
 
-  python df_hier_visualization.py --image cat.jpg --class_id 281 \\
+  # (b) cached ImageNet test image, by class id + offset
+  python df_hier_visualization.py --class_id 281 --offset 3 \\
       --df_basis df_basis_resnet50_layer3_distill_D200.pkl \\
       --ring_components 16 --top_channels 4 --recon_D 50
 """
 
 import argparse
+import io
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -67,6 +79,37 @@ from full_classes import IMAGENET2012_CLASSES
 # DataFreeReconstructor must be importable for joblib to unpickle the basis.
 from df_decomposition import (DataFreeReconstructor, MODEL_CONFIGS,  # noqa: F401
                               build_from_weights)
+
+
+# ======================================================================
+# Image loading from the cached test corpus
+# (verbatim contract from hier_visualize_pca.py's load_image_for_class)
+# ======================================================================
+
+def load_image_for_class(test_metadata_path: Path, class_id: int,
+                          offset: int = 0) -> Tuple[Image.Image, int, int]:
+    """Pull a cached ImageNet test image for `class_id` from test_metadata.pkl.
+
+    Note: this reads a *test* corpus only to choose an image to EXPLAIN; the
+    decomposition basis remains entirely calibration-free. Inference still
+    needs the single image -- that is not calibration (Observation 1).
+    """
+    if not test_metadata_path.exists():
+        raise FileNotFoundError(f"Test metadata not found at "
+                                f"{test_metadata_path}.")
+    metadata = joblib.load(test_metadata_path)
+    samples = metadata['samples']
+    class_samples = [(b, lbl) for (b, lbl) in samples if lbl == class_id]
+    n = len(class_samples)
+    if n == 0:
+        raise ValueError(f"No cached test samples for class_id={class_id}")
+    idx = offset % n
+    if offset != idx:
+        print(f"  Note: offset {offset} wrapped to {idx} "
+              f"({n} cached images).")
+    image_bytes, label = class_samples[idx]
+    assert label == class_id
+    return Image.open(io.BytesIO(image_bytes)).convert('RGB'), n, idx
 
 
 # ======================================================================
@@ -278,7 +321,8 @@ def _line(fig, p0, p1, color, lw=1.0, linestyle='-', alpha=1.0, zorder=1):
 
 
 def build_radial_figure(results: Dict, model_name: str, target_layer: str,
-                        save_path: str):
+                        save_path: str, offset: int = 0,
+                        img_idx: int = None, n_available: int = None):
     image = results['image']
     gradcam_map = results['gradcam_true']
     recon_map = results['recon_map']
@@ -401,6 +445,8 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
               f"{target_layer}  [{basis_label}]\n"
               f"true: {results['true_class'][:40]}  |  "
               f"pred: {results['pred_class'][:40]}  [{status}]")
+    if n_available is not None and img_idx is not None:
+        header += f"  (img {img_idx + 1}/{n_available}, offset={offset})"
     fig.text(0.5, 0.975, header, ha='center', va='top',
              fontsize=13, fontweight='bold')
 
@@ -468,11 +514,22 @@ def main():
     ap = argparse.ArgumentParser(
         description='Hierarchical radial visualization of the calibration-'
                     'free (data-free) Grad-CAM decomposition for one image.')
-    ap.add_argument('--image', type=str, required=True,
-                    help='Path to an input image file (jpg/png).')
+    ap.add_argument('--image', type=str, default=None,
+                    help='Path to an input image file (jpg/png). Mutually '
+                         'exclusive with --class_id; one of the two is '
+                         'required.')
     ap.add_argument('--class_id', type=int, default=None,
-                    help='Optional ImageNet class id for the true label; '
-                         'if omitted the predicted class is used as label.')
+                    help='ImageNet class id. If given (instead of --image), '
+                         'a cached test image for this class is loaded from '
+                         'test_metadata.pkl, as in hier_visualize_pca.py. '
+                         'Also used as the true label for the header.')
+    ap.add_argument('--offset', type=int, default=0,
+                    help='Which cached image to pick for --class_id '
+                         '(wraps modulo the number available).')
+    ap.add_argument('--test_data_dir', type=str,
+                    default='/data/imagenet1k_sampletest',
+                    help='Directory holding test_metadata.pkl (used only '
+                         'in --class_id mode).')
     # basis: either load a prebuilt one, or build from weights
     ap.add_argument('--df_basis', type=str, default=None,
                     help='Prebuilt DataFreeReconstructor .pkl from '
@@ -507,28 +564,51 @@ def main():
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    img_path = Path(args.image)
-    if not img_path.exists():
-        raise FileNotFoundError(f"Input image not found: {img_path}")
-    image = Image.open(img_path).convert('RGB')
+    # ---- resolve the image source: --image XOR --class_id ----
+    if (args.image is None) == (args.class_id is None):
+        raise ValueError("Provide exactly one of --image PATH or "
+                         "--class_id ID (the latter loads a cached test "
+                         "image; --offset selects which one).")
+
+    if args.class_id is not None and not (0 <= args.class_id < 1000):
+        raise ValueError(f"class_id must be in [0, 999], got {args.class_id}")
+
+    if args.image is not None:
+        # mode (a): arbitrary image file on disk
+        img_path = Path(args.image)
+        if not img_path.exists():
+            raise FileNotFoundError(f"Input image not found: {img_path}")
+        image = Image.open(img_path).convert('RGB')
+        stem = img_path.stem
+        img_idx, n_avail = None, None
+        source_desc = str(img_path)
+    else:
+        # mode (b): cached ImageNet test image, by class id + offset
+        test_meta = Path(args.test_data_dir) / "test_metadata.pkl"
+        image, n_avail, img_idx = load_image_for_class(
+            test_meta, args.class_id, offset=args.offset)
+        cname = list(IMAGENET2012_CLASSES.values())[args.class_id]
+        stem = f"class{args.class_id}_img{img_idx}"
+        source_desc = (f"cached test img {img_idx + 1}/{n_avail} for "
+                       f"class {args.class_id} ({cname[:40]}), "
+                       f"offset={args.offset}")
 
     print("=" * 80)
     print("Calibration-Free Hierarchical Grad-CAM Decomposition")
-    print(f"  Image:      {img_path}")
+    print(f"  Image:      {source_desc}")
     print(f"  Device:     {device}")
     print("=" * 80)
 
     df_basis = _load_basis(args, device)
     extractor = DFHierExtractor(df_basis, device=device)
 
-    # if no class_id, label the image by its own prediction
+    # ---- resolve the true label for the header ----
     if args.class_id is not None:
-        if not (0 <= args.class_id < 1000):
-            raise ValueError(f"class_id must be in [0, 999], got "
-                             f"{args.class_id}")
+        # both modes: class_id is the ground-truth label when supplied
         label = args.class_id
     else:
-        # quick forward pass purely to obtain a label for the header
+        # --image mode without a class id: label by the model's own
+        # prediction (a quick forward pass, purely for the header).
         tmp = extractor.transform(image).unsqueeze(0).to(extractor.device)
         with torch.no_grad():
             logits = extractor.backbone(tmp)
@@ -548,11 +628,12 @@ def main():
           f"{results['complete_resid']:.3e} "
           f"({'exact' if results['spans_full'] else 'truncated basis'})")
 
-    stem = img_path.stem
     save_path = out / (f"dfhier_{stem}_{extractor.model_name}_"
                        f"{extractor.basis_kind}.png")
     build_radial_figure(results, extractor.model_name,
-                        extractor.target_layer_name, str(save_path))
+                        extractor.target_layer_name, str(save_path),
+                        offset=args.offset, img_idx=img_idx,
+                        n_available=n_avail)
     print("=" * 80 + "\nDone.\n" + "=" * 80)
 
 
