@@ -1,6 +1,8 @@
 python df_decomposition.py --model resnet50 --target_layer layer3 --basis kernel --D 200
-python df_hier_visualization.py --class_id 281 --offset 3 \
-    --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
+python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_kernel_D200.pkl --class_id 281 --offset 3
+python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_distill.pkl --class_id 281 --offset 3
+
+    df_basis_resnet50_layer3_distill.pkl
 python df_hier_visualization.py --image cat.jpg --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
 
 python eval_unified_cam.py --model resnet50 --class_id 10 \
