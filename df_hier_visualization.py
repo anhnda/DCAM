@@ -56,7 +56,7 @@ Usage
   # (b) cached ImageNet test image, by class id + offset
   python df_hier_visualization.py --class_id 281 --offset 3 \\
       --df_basis df_basis_resnet50_layer3_distill_D200.pkl \\
-      --ring_components 16 --top_channels 4 --recon_D 50
+      --ring_components 10 --top_channels 3 --recon_D 50
 """
 
 import argparse
@@ -211,7 +211,7 @@ class DFHierExtractor:
     # -- the decomposition ---------------------------------------------
 
     def extract(self, image: Image.Image, label: int,
-                ring_components: int = 16, top_channels: int = 4,
+                ring_components: int = 10, top_channels: int = 3,
                 recon_D: int = 50) -> Dict:
         x = self.transform(image).unsqueeze(0).to(self.device)
         weights, _, pred_label = self.gradcam.forward(x, class_idx=None,
@@ -256,6 +256,27 @@ class DFHierExtractor:
             tot = L_tilde.abs().sum().clamp(min=1e-8)
             relu_keep_frac = float((pos / tot).item())
 
+            # ---- beta-energy diagnostics ----
+            # beta_d = <alpha, v_d>. If every beta is tiny it is either because
+            # alpha itself is small in norm (harmless: recon cosine is scale-
+            # invariant) or because the basis is misaligned with alpha so the
+            # energy is spread thinly over many components (Proposition 1: this
+            # is the input-patch anisotropy the corpus would correct). The
+            # top-K energy fraction tells the two apart.
+            alpha_norm = float(alpha.norm().item())
+            beta_norm = float(beta.norm().item())
+            beta_sq = beta ** 2
+            K_diag = min(ring_components, self.D_built)
+            topK_idx = torch.argsort(beta_sq, descending=True)[:K_diag]
+            topK_energy_frac = float(
+                (beta_sq[topK_idx].sum() / beta_sq.sum().clamp(min=1e-12)
+                 ).item())
+            # participation ratio: effective number of components carrying
+            # alpha's energy. PR ~ 1 => concentrated; PR ~ D => spread thin.
+            participation_ratio = float(
+                ((beta_sq.sum() ** 2)
+                 / (beta_sq ** 2).sum().clamp(min=1e-12)).item())
+
             # ---- Ring 1: top components by |beta_d| ----
             K = min(ring_components, self.D_built)
             order = torch.argsort(beta.abs(), descending=True)[:K]
@@ -290,6 +311,9 @@ class DFHierExtractor:
             'recon_map': recon.cpu(), 'recon_cos': recon_cos, 'recon_D': Dr,
             'relu_keep_frac': relu_keep_frac,
             'complete_resid': complete_resid, 'spans_full': spans_full,
+            'alpha_norm': alpha_norm, 'beta_norm': beta_norm,
+            'topK_energy_frac': topK_energy_frac,
+            'participation_ratio': participation_ratio,
             'components': comp_list,
             'num_components_total': self.D_built,
             'basis_kind': self.basis_kind, 'block_kind': self.block_kind,
@@ -351,16 +375,18 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
     }
 
     # ring 1 positions
-    R1, F1 = 0.27, 0.08
+    R1, F1 = 0.240, 0.086
     feat_pos = []
     for k in range(K):
         ang = 90.0 - (360.0 / K) * k
         feat_pos.append((cx + R1 * np.cos(np.deg2rad(ang)),
                          cy + R1 * np.sin(np.deg2rad(ang)), ang))
 
-    # ring 2 positions
-    R2, CH = 0.42, 0.055
-    arc_half = (360.0 / K) * 0.40 if K > 0 else 0.0
+    # ring 2 positions. Geometry is sized for the default 10 components x 3
+    # channels (30 panels). If the user requests substantially more panels,
+    # they may crowd -- pass smaller --ring_components / --top_channels.
+    R2, CH = 0.385, 0.060
+    arc_half = (360.0 / K) * 0.36 if K > 0 else 0.0
     ch_pos = []
     for (fx, fy, fang) in feat_pos:
         offs = [0.0] if N <= 1 else np.linspace(-arc_half, arc_half, N)
@@ -405,19 +431,22 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                  fontsize=9, fontweight='bold', color=rc)
     _set_border(ax, rc, 2.0)
 
-    # ring 1: signed component contributions beta_d * z_d
-    if K > 0:
-        cmax = max(float(c['contrib_map'].abs().max()) for c in comps)
-        cmax = cmax if cmax > 1e-8 else 1.0
-    else:
-        cmax = 1.0
+    # ring 1: signed component contributions beta_d * z_d.
+    # Each panel is normalized to its OWN symmetric range: beta_d values are
+    # often tiny and vary by orders of magnitude across components, so a single
+    # shared scale would render all but the largest panel as blank white. The
+    # raw beta_d is reported in the title; the map shows the SHAPE of the
+    # contribution, the title carries its MAGNITUDE.
     for k, (fx, fy, _) in enumerate(feat_pos):
         c = comps[k]
+        cmap_arr = c['contrib_map'].numpy()
+        local_max = float(np.abs(cmap_arr).max())
+        local_max = local_max if local_max > 1e-12 else 1.0
         ax = _add_inset(fig, fx, fy, F1, F1)
-        ax.imshow(c['contrib_map'].numpy(), cmap='bwr',
-                  vmin=-cmax, vmax=cmax, interpolation='bilinear')
-        ax.set_title(f"v{c['comp_id']}\nbeta={c['beta']:+.2f}",
-                     fontsize=8, fontweight='bold')
+        ax.imshow(cmap_arr, cmap='bwr', vmin=-local_max, vmax=local_max,
+                  interpolation='bilinear')
+        ax.set_title(f"v{c['comp_id']}\nbeta={c['beta']:+.3f}",
+                     fontsize=9, fontweight='bold')
         _set_border(ax, 'royalblue' if c['beta'] >= 0 else 'firebrick', 1.5)
 
     # ring 2: channel loadings of each weight-derived eigenvector
@@ -432,7 +461,7 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
             sign = '+' if w >= 0 else '-'
             tc = 'darkgreen' if w >= 0 else 'darkred'
             ax.set_title(f"ch{cinfo['ch_id']}\n{sign}{abs(w):.3f}",
-                         fontsize=7, fontweight='bold', color=tc)
+                         fontsize=8, fontweight='bold', color=tc)
             _set_border(ax, tc, 1.0)
 
     # header
@@ -447,22 +476,46 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
               f"pred: {results['pred_class'][:40]}  [{status}]")
     if n_available is not None and img_idx is not None:
         header += f"  (img {img_idx + 1}/{n_available}, offset={offset})"
-    fig.text(0.5, 0.975, header, ha='center', va='top',
+    fig.text(0.5, 0.992, header, ha='center', va='top',
              fontsize=13, fontweight='bold')
 
-    # completeness banner -- the headline data-free claim
+    # Status banner -- two lines in one box, placed in the clear strip between
+    # the header and the topmost ring panel (which reaches y~0.915).
+    # Line 1: completeness (the headline data-free claim, Theorem 1).
+    # Line 2: beta-energy diagnostics (is tiny beta harmless or a real
+    #         basis-misalignment signal, Proposition 1).
     cr = results['complete_resid']
     if results['spans_full']:
-        comp_txt = (f"Completeness check (D=C, Theorem 1): pre-ReLU residual "
-                    f"max-err = {cr:.2e}  -> exact (machine precision).")
-        comp_col = 'forestgreen' if cr < 1e-3 else 'firebrick'
+        comp_txt = (f"Completeness (D=C, Theorem 1): pre-ReLU residual "
+                    f"max-err = {cr:.2e} -> exact (machine precision).")
     else:
-        comp_txt = (f"Completeness: basis truncated (D={results['num_components_total']}"
-                    f" < C); rank-D residual is the truncation tail "
-                    f"sum_(d>D) beta_d z_d, NOT an identity error.")
-        comp_col = 'dimgray'
-    fig.text(0.5, 0.935, comp_txt, ha='center', va='top', fontsize=10,
-             color=comp_col, family='monospace')
+        comp_txt = (f"Completeness: basis truncated "
+                    f"(D={results['num_components_total']} < C); rank-D "
+                    f"residual is the truncation tail sum_(d>D) beta_d z_d, "
+                    f"NOT an identity error.")
+
+    tkf = results['topK_energy_frac']
+    pr = results['participation_ratio']
+    if tkf < 0.5:
+        diag_txt = (f"beta diag: ||alpha||={results['alpha_norm']:.2e}  "
+                    f"||beta||={results['beta_norm']:.2e}  top-{K} comps="
+                    f"{100 * tkf:.0f}% energy  PR={pr:.0f}  -> energy SPREAD: "
+                    f"'{basis_kind}' basis misaligned with alpha "
+                    f"(Prop. 1 anisotropy).")
+        edge_col = 'firebrick'
+    else:
+        diag_txt = (f"beta diag: ||alpha||={results['alpha_norm']:.2e}  "
+                    f"||beta||={results['beta_norm']:.2e}  top-{K} comps="
+                    f"{100 * tkf:.0f}% energy  PR={pr:.0f}  -> concentrated; "
+                    f"small beta reflects small ||alpha|| "
+                    f"(recon cosine is scale-free).")
+        edge_col = 'darkgreen'
+
+    fig.text(0.5, 0.945, comp_txt + '\n' + diag_txt, ha='center',
+             va='center', fontsize=8.8, family='monospace', color='black',
+             linespacing=1.5,
+             bbox=dict(boxstyle='round', facecolor='white',
+                       edgecolor=edge_col, alpha=0.95, linewidth=1.5))
 
     # footer legend
     legend = [
@@ -549,9 +602,9 @@ def main():
     ap.add_argument('--distill_bs', type=int, default=16)
     ap.add_argument('--distill_iters', type=int, default=400)
     # visualization knobs (parity with hier_visualize_pca.py)
-    ap.add_argument('--ring_components', type=int, default=16,
+    ap.add_argument('--ring_components', type=int, default=10,
                     help='How many top-|beta| components in ring 1.')
-    ap.add_argument('--top_channels', type=int, default=4,
+    ap.add_argument('--top_channels', type=int, default=3,
                     help='Top channel loadings per component in ring 2.')
     ap.add_argument('--recon_D', type=int, default=50,
                     help='Rank used for the center reconstruction panel.')
@@ -627,6 +680,20 @@ def main():
     print(f"  full-rank completeness residual: "
           f"{results['complete_resid']:.3e} "
           f"({'exact' if results['spans_full'] else 'truncated basis'})")
+    print(f"  --- beta diagnostics ---")
+    print(f"  ||alpha|| = {results['alpha_norm']:.4e}   "
+          f"||beta|| = {results['beta_norm']:.4e}")
+    print(f"  top-{args.ring_components} components capture "
+          f"{100 * results['topK_energy_frac']:.1f}% of ||beta||^2 energy")
+    print(f"  participation ratio = {results['participation_ratio']:.1f} "
+          f"effective components (of {results['num_components_total']})")
+    if results['topK_energy_frac'] < 0.5:
+        print(f"  -> beta energy is SPREAD across many components: the "
+              f"'{extractor.basis_kind}' basis is misaligned with alpha "
+              f"(Proposition 1 anisotropy). Try basis='bn' or 'distill'.")
+    elif results['alpha_norm'] < 1e-2:
+        print(f"  -> beta values are small because ||alpha|| is small; "
+              f"this is harmless (recon cosine is scale-invariant).")
 
     save_path = out / (f"dfhier_{stem}_{extractor.model_name}_"
                        f"{extractor.basis_kind}.png")
