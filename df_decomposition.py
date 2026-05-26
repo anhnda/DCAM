@@ -110,8 +110,12 @@ def fold_conv_bn(conv: nn.Conv2d,
     """
     Wc = conv.weight.detach().clone()                       # [O, I, kh, kw]
     O = Wc.shape[0]
+    # IMPORTANT: the fallback bias must live on the SAME device/dtype as the
+    # conv weight. ResNet conv layers have no bias (BN follows), so this
+    # branch is the common case -- a CPU-default zeros() here would clash
+    # with a CUDA backbone.
     bc = (conv.bias.detach().clone() if conv.bias is not None
-          else torch.zeros(O, dtype=Wc.dtype))
+          else torch.zeros(O, dtype=Wc.dtype, device=Wc.device))
 
     if bn is None:
         return Wc.reshape(O, -1), bc
@@ -226,6 +230,9 @@ def get_bn_stats(backbone: nn.Module, model_name: str,
                         'bn' basis to weight WW^T by per-channel scale
                         (Definition 1, BN-tilted variant).
     """
+    # device of the backbone -- all fallback tensors must match it.
+    dev = next(backbone.parameters()).device
+
     if model_name in ('resnet50', 'resnet18'):
         stage = {'layer1': backbone.layer1, 'layer2': backbone.layer2,
                  'layer3': backbone.layer3, 'layer4': backbone.layer4
@@ -243,15 +250,15 @@ def get_bn_stats(backbone: nn.Module, model_name: str,
             h_hat = bn.running_var.detach().clone()
         else:
             # plain VGG (no BN): BN proxy unavailable -> zero offset, unit tilt.
-            mu = torch.zeros(C_out)
-            h_hat = torch.ones(C_out)
+            mu = torch.zeros(C_out, device=dev)
+            h_hat = torch.ones(C_out, device=dev)
     else:
         raise ValueError(f"Unsupported model '{model_name}'.")
 
     if mu.numel() != C_out:
         # defensive: fall back to zero offset of the right width
-        mu = torch.zeros(C_out)
-        h_hat = torch.ones(C_out)
+        mu = torch.zeros(C_out, device=dev)
+        h_hat = torch.ones(C_out, device=dev)
     return mu, h_hat
 
 
@@ -482,13 +489,21 @@ def build_from_weights(model_name: str, target_layer_name: str, D: int,
                        distill_batches: int = 8, distill_bs: int = 16,
                        distill_iters: int = 400, distill_lr: float = 0.1,
                        distill_seed: int = 0,
-                       device: str = 'cpu') -> DataFreeReconstructor:
+                       device: str = 'auto') -> DataFreeReconstructor:
     """Build a DataFreeReconstructor from a pretrained checkpoint, no corpus.
 
-    basis : 'kernel' | 'bn' | 'distill'
+    basis  : 'kernel' | 'bn' | 'distill'
+    device : 'auto' (use CUDA if available -- the default), 'cuda', or 'cpu'.
     """
-    dev = torch.device(device if torch.cuda.is_available()
-                        or device == 'cpu' else 'cpu')
+    if device == 'auto':
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif device == 'cuda' and not torch.cuda.is_available():
+        print("  WARNING: --device cuda requested but CUDA is unavailable; "
+              "falling back to CPU.")
+        dev = torch.device('cpu')
+    else:
+        dev = torch.device(device)
+    print(f"  Device: {dev}")
     backbone = MODEL_CONFIGS[model_name]['model_fn']().to(dev).eval()
 
     W, block_kind, winfo = get_effective_operator(
@@ -521,6 +536,15 @@ def build_from_weights(model_name: str, target_layer_name: str, D: int,
     else:
         raise ValueError(f"Unknown basis '{basis}'. "
                          f"Choose kernel | bn | distill.")
+
+    # The basis is a static artifact to be pickled and reloaded elsewhere;
+    # normalise every tensor to CPU so the .pkl is device-agnostic. Builders
+    # return V on whatever device W lived on (CUDA when the backbone is),
+    # except build_distill_basis which already returns CPU -- unify here.
+    V = V.detach().cpu().contiguous()
+    mu = mu.detach().cpu().contiguous()
+    if sv is not None:
+        sv = sv.detach().cpu().contiguous()
 
     # orthonormality check -- completeness (Theorem 1) depends on it
     gram = V.T @ V
@@ -560,7 +584,12 @@ def main():
     ap.add_argument('--distill_iters', type=int, default=400)
     ap.add_argument('--distill_lr', type=float, default=0.1)
     ap.add_argument('--distill_seed', type=int, default=0)
-    ap.add_argument('--device', type=str, default='cpu')
+    ap.add_argument('--device', type=str, default='auto',
+                    choices=['auto', 'cuda', 'cpu'],
+                    help="Compute device. 'auto' (default) uses CUDA when "
+                         "available -- important for the 'distill' basis, "
+                         "which is many forward+backward passes and is "
+                         "extremely slow on CPU.")
     ap.add_argument('--output', type=str, default=None,
                     help='Output .pkl path for the DataFreeReconstructor.')
     args = ap.parse_args()
