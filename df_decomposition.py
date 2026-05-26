@@ -619,9 +619,13 @@ class DataFreeReconstructor(nn.Module):
 
 def build_from_weights(model_name: str, target_layer_name: str, D: int,
                        basis: str = 'kernel',
-                       distill_batches: int = 8, distill_bs: int = 16,
+                       distill_batches: int = 2, distill_bs: int = 32,
                        distill_iters: int = 400, distill_lr: float = 0.1,
                        distill_seed: int = 0,
+                       distill_harvest_passes: int = 8,     # NEW
+                       distill_harvest_bs: int = 64,        # NEW
+                       distill_bn_stride: int = 1,          # NEW (optional)
+                       distill_use_amp: bool = True,        # NEW (optional)
                        device: str = 'auto') -> DataFreeReconstructor:
     """Build a DataFreeReconstructor from a pretrained checkpoint, no corpus.
 
@@ -666,10 +670,12 @@ def build_from_weights(model_name: str, target_layer_name: str, D: int,
             backbone, model_name, target_layer_name, C_out, D,
             n_batches=distill_batches, batch_size=distill_bs,
             iters=distill_iters, lr=distill_lr, device=dev,
-            seed=distill_seed)
+            seed=distill_seed,
+            harvest_passes=distill_harvest_passes,    # NEW
+            harvest_bs=distill_harvest_bs,            # NEW
+            bn_stride=distill_bn_stride,              # NEW
+            use_amp=distill_use_amp)                  # NEW
         sv = None
-        # the distilled forward pass yields its own activation-mean estimate;
-        # it is the more faithful offset than the raw BN proxy.
         mu = mu_d
         meta = dict(winfo); meta.update(dinfo)
     else:
@@ -724,8 +730,21 @@ def main():
     ap.add_argument('--distill_iters', type=int, default=400)
     ap.add_argument('--distill_lr', type=float, default=0.1)
     ap.add_argument('--distill_seed', type=int, default=0)
-    ap.add_argument('--distill_harvest_passes', type=int, default=8)
-    ap.add_argument('--distill_harvest_bs',     type=int, default=64)
+    ap.add_argument('--distill_harvest_passes', type=int, default=8,
+                    help='Forward-only harvest passes per synthesised batch. '
+                         'Each pass yields harvest_bs*H*W cells for Sigma~. '
+                         'Cheap compared to synthesis; bump this, not '
+                         '--distill_batches, when Sigma~ looks noisy.')
+    ap.add_argument('--distill_harvest_bs', type=int, default=64,
+                    help='Batch size for each harvest pass. Independent of '
+                         '--distill_bs (the synthesis batch); harvest can be '
+                         'larger since it has no backward pass.')
+    ap.add_argument('--distill_bn_stride', type=int, default=1,
+                    help='Match every k-th BN layer during synthesis. k=2-4 '
+                         'gives a small per-step speedup at a small basis-'
+                         'fidelity cost.')
+    ap.add_argument('--no_amp', action='store_true',
+                    help='Disable mixed-precision synthesis (debug only).')
     ap.add_argument('--device', type=str, default='auto',
                     choices=['auto', 'cuda', 'cpu'],
                     help="Compute device. 'auto' (default) uses CUDA when "
@@ -757,7 +776,12 @@ def main():
         args.model, args.target_layer, args.D, basis=args.basis,
         distill_batches=args.distill_batches, distill_bs=args.distill_bs,
         distill_iters=args.distill_iters, distill_lr=args.distill_lr,
-        distill_seed=args.distill_seed, device=args.device)
+        distill_seed=args.distill_seed,
+        distill_harvest_passes=args.distill_harvest_passes,   # NEW
+        distill_harvest_bs=args.distill_harvest_bs,           # NEW
+        distill_bn_stride=args.distill_bn_stride,             # NEW
+        distill_use_amp=not args.no_amp,                      # NEW
+        device=args.device)
 
     joblib.dump(recon, args.output)
     print(f"\n  {recon}")
