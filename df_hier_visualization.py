@@ -16,12 +16,36 @@ the network weights by df_decomposition.py:
                 (basis='kernel'/'bn'), or eigvecs of a BN-distilled Sigma~
                 (basis='distill').  -- all corpus-free, Definition 1 / Sec. 5
 
-PER-LATENT CHANNEL SUPPORT (this revision)
-------------------------------------------
+PER-IMAGE PCA MODE (--pca)
+--------------------------
+When --pca is set, the basis and offset are estimated by PCA on the activation
+cells of the SINGLE IMAGE being explained:
+
+    cells   = A_norm[0].permute(1,2,0).reshape(HW, C)
+    mu_img  = cells.mean(0)                       (per-image channel mean)
+    Sigma~  = (cells - mu_img)^T (cells - mu_img) / HW
+    v_d     = top-D eigenvectors of Sigma~
+
+This is a fourth rung on the H_in ladder: kernel (white) -> bn (diagonal) ->
+distill (full, synthesised) -> pca (full, the image itself). It is per-image,
+not corpus-derived, so it is NOT "calibration-free" in the dataset-shared
+sense -- but it requires nothing the explanation pass doesn't already need
+(just one image), and gives the BEST possible basis FOR THIS IMAGE under
+Proposition 1: the data-optimal basis of an image-conditional Sigma~ at zero
+extra cost. The rank of Sigma~ is at most min(HW, C) - 1; D is silently capped.
+
+Theorem 1 still holds (completeness is basis- and mean-agnostic). At full rank
+(D = rank(Sigma~)) the reconstruction is exact in range(Sigma~); the truncation
+deficit on the FULL pre-ReLU map is the projection error onto that range, which
+is zero for any image's own activations because every cell lives in
+range(cells - mu_img) by construction.
+
+PER-LATENT CHANNEL SUPPORT (unchanged)
+--------------------------------------
 Each latent map z_d = <A - mu, v_d> is a sum over ALL C output channels. The
 ring-2 panels only show the top-`top_channels` (default 3) loadings, which is
 FAR too few to actually rebuild z_d -- you cannot see "the sum" from 3 panels.
-So each ring-1 panel now also reports, in its title:
+So each ring-1 panel reports, in its title:
 
     Nz=<m> ch -> 95%     m = smallest number of channels (added most-significant
                              first by |v_{d,c}|) whose partial sum reconstructs
@@ -31,10 +55,6 @@ So each ring-1 panel now also reports, in its title:
                              95% of its OWN energy (||v_d^(m')|| / ||v_d|| >= 0.95).
                              This is INTRINSIC to the basis (image-independent).
 
-The gap Nz vs Nv is the sparse-PCA evidence: if Nz << Nv the image's activation
-sparsifies a nominally-dense direction; if both are small the direction is
-genuinely channel-sparse; if both are large z_d is dense (Proposition 1).
-
 Layout (verbatim geometry from hier_visualize_pca.py)
 -----------------------------------------------------
   CENTER triangle : input image | true Grad-CAM | rank-D reconstruction.
@@ -42,20 +62,21 @@ Layout (verbatim geometry from hier_visualize_pca.py)
   RING 2          : per-component channel loadings v_{d,c} (the channels that
                     COMPOSE each weight-derived direction).
 
-Prerequisite: a basis .pkl built by df_decomposition.py.
-
 Image source -- two mutually exclusive modes
 ---------------------------------------------
   (a) --image PATH            explain an arbitrary image file on disk.
   (b) --class_id ID [--offset N]
                               pull a cached ImageNet test image for that
-                              class from test_metadata.pkl, exactly as
-                              hier_visualize_pca.py does.
+                              class from test_metadata.pkl.
 
 Usage
 -----
   python df_hier_visualization.py --image cat.jpg \\
       --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
+
+  # per-image PCA (no .pkl needed; basis is built from the image's activations)
+  python df_hier_visualization.py --image cat.jpg --pca \\
+      --model resnet50 --target_layer layer3 --D 100
 
   python df_hier_visualization.py --class_id 281 --offset 3 \\
       --df_basis df_basis_resnet50_layer3_distill_D200.pkl \\
@@ -66,7 +87,7 @@ import argparse
 import io
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -119,28 +140,101 @@ def load_image_for_class(test_metadata_path: Path, class_id: int,
 
 
 # ======================================================================
-# Extractor: backbone + Grad-CAM + a weight-derived (data-free) basis
+# Per-image PCA: build {v_d}, mu from the activations of one image
+# ======================================================================
+
+def build_image_pca_basis(cells: torch.Tensor, D: int
+                          ) -> Tuple[torch.Tensor, torch.Tensor,
+                                     torch.Tensor, int]:
+    """PCA of ONE image's per-cell activations.
+
+    cells : [HW, C] activation cells from the single image being explained.
+    D     : requested number of components; capped at rank(Sigma~).
+
+    Returns
+    -------
+    mu_img : [C]      per-image channel mean (the proper data offset for THIS
+                     image's covariance; gives genuinely zero-mean cells).
+    V      : [C, D']  top-D' eigenvectors of Sigma~ = (cells - mu)^T(cells - mu)/HW.
+                     Orthonormal in R^C; columns sign-fixed (largest |entry| > 0)
+                     for full determinism, matching Theorem 2's symmetry rule.
+    sv     : [D']     corresponding eigenvalues (nonneg), descending.
+    D_eff  : int      effective rank kept = min(D, rank(Sigma~)).
+
+    Rank of Sigma~ is at most min(HW, C) - 1 (one DoF removed by centering).
+    For ResNet-50 layer3 (HW=196, C=1024) that ceiling is 195. The truncation
+    deficit (Proposition 1) collapses to zero within range(cells - mu) because
+    every cell is exactly representable there by construction; outside that
+    range the basis is silent, but Theorem 1's completeness still holds on
+    the per-image span.
+    """
+    HW, C = cells.shape
+    mu_img = cells.mean(dim=0)                                  # [C]
+    Xc = cells - mu_img.view(1, -1)                              # [HW, C]
+
+    # SVD of the centred cell matrix gives eigenvectors of Xc^T Xc (== Sigma~ up
+    # to the 1/HW factor that does not affect eigenvectors). Use SVD rather
+    # than forming the C x C product when HW < C: it's cheaper and numerically
+    # cleaner. Returns V_h with rows = right singular vectors of Xc, which are
+    # the eigenvectors of Sigma~ in C-space.
+    # Xc = U S V^T  =>  Sigma~ ~ V S^2 V^T  =>  eigvecs = columns of V.
+    _, s, Vh = torch.linalg.svd(Xc, full_matrices=False)         # s:[k], Vh:[k,C]
+    # rank cap: numerically nonzero singular values
+    tol = max(HW, C) * s.max().clamp(min=1e-12) * torch.finfo(s.dtype).eps
+    rank = int((s > tol).sum().item())
+    D_eff = min(D, rank)
+    V = Vh[:D_eff].T.contiguous()                                # [C, D_eff]
+    sv = (s[:D_eff] ** 2) / max(HW, 1)                           # eigvals of Sigma~
+
+    # sign convention (matches df_decomposition._topD_left_singular)
+    for d in range(D_eff):
+        col = V[:, d]
+        if col[torch.argmax(col.abs())] < 0:
+            V[:, d] = -col
+
+    return mu_img, V, sv, D_eff
+
+
+# ======================================================================
+# Extractor: backbone + Grad-CAM + a (data-free or per-image) basis
 # ======================================================================
 
 class DFHierExtractor:
-    """Runs Grad-CAM and decomposes it with a calibration-free basis."""
+    """Runs Grad-CAM and decomposes it with a calibration-free OR per-image
+    basis. The per-image PCA path overrides `self.mu` / `self.V_full` inside
+    `extract()` AFTER the forward pass has produced this image's activations.
+    """
 
-    def __init__(self, df_basis: DataFreeReconstructor, device='cuda'):
+    def __init__(self, df_basis: DataFreeReconstructor, device='cuda',
+                 image_pca: bool = False, image_pca_D: int = 200):
         self.device = torch.device(device if torch.cuda.is_available()
                                    else 'cpu')
         self.recon = df_basis.to(self.device).eval()
         self.model_name = self.recon.model_name
         self.target_layer_name = self.recon.target_layer
-        self.basis_kind = self.recon.basis_kind
+        self.image_pca = image_pca
+        self.image_pca_D = image_pca_D
+        # basis_kind/block_kind get reset per image when image_pca=True.
+        self.basis_kind = ('pca_image' if image_pca else self.recon.basis_kind)
         self.block_kind = self.recon.block_kind
 
+        # mu / V_full are only the placeholder when image_pca=True. They are
+        # OVERWRITTEN inside extract() once we have the image's activations.
         self.mu = self.recon.pca_mu.detach().to(self.device)        # [C]
         self.V_full = self.recon.pca_V.detach().to(self.device)     # [C, D]
         self.D_built = self.V_full.shape[1]
         self.C = self.mu.shape[0]
-        print(f"Loaded data-free basis: {self.recon}")
-        print(f"  basis='{self.basis_kind}'  C={self.C}  D_built={self.D_built}"
-              f"  (weight-derived, corpus-free, seed-stable)")
+
+        if self.image_pca:
+            print(f"Per-image PCA mode: basis will be built from the image's "
+                  f"own activations (D requested = {self.image_pca_D}).")
+            print(f"  Placeholder df_basis (for backbone/layer/shapes only): "
+                  f"{self.recon}")
+        else:
+            print(f"Loaded data-free basis: {self.recon}")
+            print(f"  basis='{self.basis_kind}'  C={self.C}  "
+                  f"D_built={self.D_built}  "
+                  f"(weight-derived, corpus-free, seed-stable)")
 
         self.backbone = MODEL_CONFIGS[self.model_name]['model_fn']() \
             .to(self.device).eval()
@@ -228,14 +322,30 @@ class DFHierExtractor:
             A_raw = self.layer_activations.clone()
             A_norm = self._normalize(A_raw)
             _, C, H, W = A_norm.shape
+            cells = A_norm[0].permute(1, 2, 0).reshape(-1, C)     # [HW, C]
+
+            # =========================================================
+            # PER-IMAGE PCA: build the basis NOW, from this image's cells.
+            # Override mu / V_full / D_built for the rest of extract().
+            # =========================================================
+            if self.image_pca:
+                mu_img, V_img, sv_img, D_eff = build_image_pca_basis(
+                    cells, self.image_pca_D)
+                self.mu = mu_img
+                self.V_full = V_img
+                self.D_built = D_eff
+                print(f"  [pca] per-image basis built: D_eff={D_eff} "
+                      f"(rank-capped from D_req={self.image_pca_D}; "
+                      f"HW={H * W}, C={C}, ceiling={min(H * W, C) - 1})")
+                print(f"  [pca] top-5 eigvals of Sigma~: "
+                      f"{sv_img[:5].cpu().numpy().round(4).tolist()}")
 
             # true (pre-ReLU) Grad-CAM map and its ReLU
             L_tilde = (alpha.view(-1, 1, 1) * A_norm[0]).sum(dim=0)
             gradcam_true = F.relu(L_tilde)
 
-            # ---- calibration-free additive decomposition (Theorem 1) ----
+            # ---- additive decomposition (Theorem 1) ----
             #   z_d  = <A - mu, v_d>     beta_d = <alpha, v_d>   b = <alpha, mu>
-            cells = A_norm[0].permute(1, 2, 0).reshape(-1, C)     # [HW, C]
             centered = cells - self.mu
             z = (centered @ self.V_full).T.reshape(self.D_built, H, W)
             beta = (alpha @ self.V_full)                          # [D_built]
@@ -250,9 +360,11 @@ class DFHierExtractor:
                                            * bf.norm().clamp(min=1e-8)))
 
             # ---- full-rank completeness check (Theorem 1) ----
+            # In image-PCA mode, range(V_full) is exactly the per-image span
+            # of centred cells, so the residual is ~0 even when D_built < C.
             L_recon_full = bias + comp.sum(dim=0)                  # [H,W]
             complete_resid = float((L_recon_full - L_tilde).abs().max())
-            spans_full = (self.D_built == C)
+            spans_full = (self.D_built == C) or self.image_pca
 
             # ReLU clipping fraction
             pos = L_tilde.clamp(min=0).sum()
@@ -280,9 +392,7 @@ class DFHierExtractor:
             K = min(ring_components, self.D_built)
             order = torch.argsort(beta.abs(), descending=True)[:K]
 
-            # collect channel-support stats across the shown components, too
             nz_list, nv_list = [], []
-
             comp_list: List[Dict] = []
             for d_t in order:
                 d = int(d_t.item())
@@ -291,33 +401,24 @@ class DFHierExtractor:
                 v_d = self.V_full[:, d]                           # [C] loadings
 
                 # ============================================================
-                # PER-LATENT CHANNEL SUPPORT
-                # z_d = <A - mu, v_d> sums over ALL C channels. Count how many
-                # channels (added most-significant-first by |v_{d,c}|) are
-                # needed to reach the cosine target.
+                # PER-LATENT CHANNEL SUPPORT (Nz, Nv)
                 # ============================================================
                 order_ch = torch.argsort(v_d.abs(), descending=True)  # [C]
 
-                # --- Nz: IMAGE-conditional support of the z_d MAP -----------
-                # partial sums of the per-channel contribution terms
-                #   term_c = (A_c - mu_c) * v_{d,c}   (a full [HW] map each)
                 z_d_full = z[d].reshape(-1)                       # [HW]
                 z_norm = z_d_full.norm().clamp(min=1e-12)
-                terms = centered[:, order_ch] * v_d[order_ch].view(1, -1)  # [HW,C]
+                terms = centered[:, order_ch] * v_d[order_ch].view(1, -1)
                 z_cum = torch.cumsum(terms, dim=1)                # [HW,C]
                 cos_cum = (z_cum * z_d_full.view(-1, 1)).sum(dim=0) \
                           / (z_cum.norm(dim=0).clamp(min=1e-12) * z_norm)
                 hit_z = (cos_cum >= COS_TARGET).nonzero()
                 n_ch_z = (int(hit_z[0].item()) + 1) if hit_z.numel() > 0 else C
 
-                # --- Nv: INTRINSIC support of the loading vector v_d --------
-                # how many |v_{d,c}| to reach 95% of the loading's own energy
                 v_sq_sorted = (v_d[order_ch] ** 2)
                 v_cum = torch.cumsum(v_sq_sorted, dim=0)
                 v_total = v_cum[-1].clamp(min=1e-12)
                 hit_v = ((v_cum / v_total) >= COS_TARGET).nonzero()
                 n_ch_v = (int(hit_v[0].item()) + 1) if hit_v.numel() > 0 else C
-                # ============================================================
 
                 nz_list.append(n_ch_z)
                 nv_list.append(n_ch_v)
@@ -385,15 +486,14 @@ def grade_beta_energy(results: Dict) -> Dict:
         tier = 'PARTIAL'
         color = 'darkorange'
         verdict = (f"mild spread -- some Proposition-1 anisotropy; "
-                   f"compare the 'bn' / 'distill' bases to see beta "
+                   f"compare other bases (bn / distill / pca) to see beta "
                    f"concentrate.")
     else:
         tier = 'SPREAD'
         color = 'firebrick'
         verdict = (f"energy SPREAD over many components: the '{basis}' basis "
                    f"is misaligned with alpha (Proposition 1 anisotropy) -- "
-                   f"try 'bn' / 'distill'.")
-
+                   f"try 'bn' / 'distill' / 'pca'.")
     msg = (f"||alpha||={results['alpha_norm']:.2e}  "
            f"||beta||={results['beta_norm']:.2e}  |  "
            f"top-K energy={100 * tkf:.0f}% (random~{100 * results['random_baseline']:.0f}%, "
@@ -512,9 +612,6 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
     _set_border(ax, rc, 2.0)
 
     # ring 1: signed component contributions beta_d * z_d.
-    # Title now also reports the per-latent channel support:
-    #   Nz = channels to rebuild the z_d MAP to >=95% cos (image-conditional)
-    #   Nv = channels for the LOADING v_d to reach 95% energy (intrinsic)
     for k, (fx, fy, _) in enumerate(feat_pos):
         c = comps[k]
         cmap_arr = c['contrib_map'].numpy()
@@ -528,7 +625,7 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                      fontsize=8, fontweight='bold')
         _set_border(ax, 'royalblue' if c['beta'] >= 0 else 'firebrick', 1.5)
 
-    # ring 2: channel loadings of each weight-derived eigenvector
+    # ring 2: channel loadings of each eigenvector
     for k, cl in enumerate(ch_pos):
         c = comps[k]
         for (cpos, cinfo) in zip(cl, c['channels']):
@@ -547,7 +644,8 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
     status = "CORRECT" if correct else "WRONG"
     basis_label = {'kernel': 'weight-derived (WW^T, white surrogate)',
                    'bn': 'weight-derived (BN-tilted)',
-                   'distill': 'BN-distilled (ZeroQ-style synthesis)'
+                   'distill': 'BN-distilled (ZeroQ-style synthesis)',
+                   'pca_image': 'per-image PCA (Sigma~ from THIS image\'s cells)',
                    }.get(basis_kind, basis_kind)
     header = (f"Calibration-Free Grad-CAM decomposition  --  {model_name} @ "
               f"{target_layer}  [{basis_label}]\n"
@@ -560,7 +658,11 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
 
     # status banner
     cr = results['complete_resid']
-    if results['spans_full']:
+    if basis_kind == 'pca_image':
+        comp_txt = (f"Completeness (per-image PCA): pre-ReLU residual "
+                    f"max-err = {cr:.2e} -> exact on the per-image span "
+                    f"(every cell lies in range(Sigma~) by construction).")
+    elif results['spans_full']:
         comp_txt = (f"Completeness (D=C, Theorem 1): pre-ReLU residual "
                     f"max-err = {cr:.2e} -> exact (machine precision).")
     else:
@@ -586,13 +688,20 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                        edgecolor=grade['color'], alpha=0.95, linewidth=1.8))
 
     # footer legend
+    if basis_kind == 'pca_image':
+        basis_blurb = (f"Basis is PER-IMAGE PCA: {basis_label} -- NOT "
+                       f"corpus-derived, but NOT dataset-shared either. The "
+                       f"image-conditional optimum under Proposition 1.")
+    else:
+        basis_blurb = (f"Basis is CALIBRATION-FREE: {basis_label} -- read "
+                       f"from network weights, no corpus. Target block kind: "
+                       f"{block_kind} (Remark 1: identity-shortcut blocks "
+                       f"carry upstream skip directions).")
     legend = [
         f"Grad-CAM = ReLU( bias + sum_d beta_d * v_d ).  Center: input | "
         f"Grad-CAM | rank-{recon_D} reconstruction (cos={recon_cos:.3f}, "
         f"ReLU keeps {100 * results['relu_keep_frac']:.0f}% of pre-ReLU mass).",
-        f"Basis is CALIBRATION-FREE: {basis_label} -- read from network "
-        f"weights, no corpus. Target block kind: {block_kind} "
-        f"(Remark 1: identity-shortcut blocks carry upstream skip directions).",
+        basis_blurb,
         f"Ring 1: top-{K} components by |beta_d| (of "
         f"{results['num_components_total']}). Title Nz = # channels to rebuild "
         f"that z_d MAP to >=95% cos (the 'sum' the {N}-panel ring 2 can't show); "
@@ -615,13 +724,27 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
 # ======================================================================
 
 def _load_basis(args, device: str) -> DataFreeReconstructor:
-    """Load a prebuilt basis .pkl, or build one on the fly from weights."""
+    """Load a prebuilt basis .pkl, or build one on the fly from weights.
+
+    When --pca is set the returned basis is only a PLACEHOLDER for backbone /
+    target-layer / shape info; the real per-image basis is constructed inside
+    extract(). To keep that placeholder cheap we always build a small 'kernel'
+    basis (no synthesis, no I/O) when --pca is on and no .pkl is given.
+    """
     if args.df_basis is not None:
         path = Path(args.df_basis)
         if not path.exists():
             raise FileNotFoundError(f"df_basis not found: {path}")
-        print(f"Loading data-free basis from {path}...")
+        print(f"Loading basis (used as placeholder in --pca mode) from "
+              f"{path}..." if args.pca
+              else f"Loading data-free basis from {path}...")
         return joblib.load(path)
+    if args.pca:
+        print(f"--pca mode: building a small 'kernel' placeholder basis from "
+              f"{args.model} weights (the real basis is per-image)...")
+        return build_from_weights(args.model, args.target_layer,
+                                  D=max(args.D, 2), basis='kernel',
+                                  device=device)
     print(f"No --df_basis given; building '{args.basis}' basis from "
           f"{args.model} weights on the fly...")
     return build_from_weights(
@@ -633,7 +756,9 @@ def _load_basis(args, device: str) -> DataFreeReconstructor:
 def main():
     ap = argparse.ArgumentParser(
         description='Hierarchical radial visualization of the calibration-'
-                    'free (data-free) Grad-CAM decomposition for one image.')
+                    'free (data-free) Grad-CAM decomposition for one image. '
+                    'Pass --pca to estimate the basis from the explained '
+                    'image\'s own activations instead of from weights.')
     ap.add_argument('--image', type=str, default=None,
                     help='Path to an input image file (jpg/png). Mutually '
                          'exclusive with --class_id.')
@@ -645,13 +770,23 @@ def main():
                     default='/data/imagenet1k_sampletest',
                     help='Directory holding test_metadata.pkl.')
     ap.add_argument('--df_basis', type=str, default=None,
-                    help='Prebuilt DataFreeReconstructor .pkl.')
+                    help='Prebuilt DataFreeReconstructor .pkl. Optional in '
+                         '--pca mode (only used as a placeholder).')
     ap.add_argument('--model', type=str, default='resnet50',
                     choices=list(MODEL_CONFIGS.keys()))
     ap.add_argument('--target_layer', type=str, default=None)
     ap.add_argument('--basis', type=str, default='kernel',
-                    choices=['kernel', 'bn', 'distill'])
-    ap.add_argument('--D', type=int, default=200)
+                    choices=['kernel', 'bn', 'distill'],
+                    help='Weight-derived basis to build if --df_basis is not '
+                         'given. Ignored when --pca is set.')
+    ap.add_argument('--pca', action='store_true',
+                    help='Per-image PCA mode: estimate the basis {v_d} and '
+                         'offset mu from the activation cells of the SINGLE '
+                         'image being explained (no corpus, no synthesis). '
+                         'D is rank-capped at min(HW, C) - 1.')
+    ap.add_argument('--D', type=int, default=200,
+                    help='Number of components requested. For --pca, '
+                         'silently capped at rank(Sigma~).')
     ap.add_argument('--distill_batches', type=int, default=8)
     ap.add_argument('--distill_bs', type=int, default=16)
     ap.add_argument('--distill_iters', type=int, default=400)
@@ -696,13 +831,17 @@ def main():
                        f"offset={args.offset}")
 
     print("=" * 80)
-    print("Calibration-Free Hierarchical Grad-CAM Decomposition")
+    if args.pca:
+        print("PER-IMAGE PCA Hierarchical Grad-CAM Decomposition")
+    else:
+        print("Calibration-Free Hierarchical Grad-CAM Decomposition")
     print(f"  Image:      {source_desc}")
     print(f"  Device:     {device}")
     print("=" * 80)
 
     df_basis = _load_basis(args, device)
-    extractor = DFHierExtractor(df_basis, device=device)
+    extractor = DFHierExtractor(df_basis, device=device,
+                                image_pca=args.pca, image_pca_D=args.D)
 
     if args.class_id is not None:
         label = args.class_id
@@ -724,7 +863,7 @@ def main():
           f"{results['recon_cos']:.4f}")
     print(f"  full-rank completeness residual: "
           f"{results['complete_resid']:.3e} "
-          f"({'exact' if results['spans_full'] else 'truncated basis'})")
+          f"({'exact / per-image span' if results['spans_full'] else 'truncated basis'})")
     print(f"  --- beta diagnostics ---")
     print(f"  ||alpha|| = {results['alpha_norm']:.4e}   "
           f"||beta|| = {results['beta_norm']:.4e}")
