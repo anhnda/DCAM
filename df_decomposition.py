@@ -724,6 +724,8 @@ def main():
     ap.add_argument('--distill_iters', type=int, default=400)
     ap.add_argument('--distill_lr', type=float, default=0.1)
     ap.add_argument('--distill_seed', type=int, default=0)
+    ap.add_argument('--distill_harvest_passes', type=int, default=8)
+    ap.add_argument('--distill_harvest_bs',     type=int, default=64)
     ap.add_argument('--device', type=str, default='auto',
                     choices=['auto', 'cuda', 'cpu'],
                     help="Compute device. 'auto' (default) uses CUDA when "
