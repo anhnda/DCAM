@@ -261,21 +261,31 @@ class DFHierExtractor:
             # alpha itself is small in norm (harmless: recon cosine is scale-
             # invariant) or because the basis is misaligned with alpha so the
             # energy is spread thinly over many components (Proposition 1: this
-            # is the input-patch anisotropy the corpus would correct). The
-            # top-K energy fraction tells the two apart.
+            # is the input-patch anisotropy the corpus would correct).
             alpha_norm = float(alpha.norm().item())
             beta_norm = float(beta.norm().item())
             beta_sq = beta ** 2
+            beta_sq_total = float(beta_sq.sum().clamp(min=1e-12).item())
             K_diag = min(ring_components, self.D_built)
-            topK_idx = torch.argsort(beta_sq, descending=True)[:K_diag]
+            sorted_sq, _ = torch.sort(beta_sq, descending=True)
             topK_energy_frac = float(
-                (beta_sq[topK_idx].sum() / beta_sq.sum().clamp(min=1e-12)
-                 ).item())
+                (sorted_sq[:K_diag].sum().item()) / beta_sq_total)
+            # top-1 share: distinguishes "first component dominates, rest
+            # flat" from "energy genuinely concentrated in a few".
+            top1_share = float(sorted_sq[0].item() / beta_sq_total)
             # participation ratio: effective number of components carrying
             # alpha's energy. PR ~ 1 => concentrated; PR ~ D => spread thin.
             participation_ratio = float(
                 ((beta_sq.sum() ** 2)
                  / (beta_sq ** 2).sum().clamp(min=1e-12)).item())
+            # concentration ratio: observed top-K energy vs what a RANDOM
+            # (isotropic) basis would capture (~ K/D). CR = 1.0 means the
+            # basis is no better than random for this image; higher is
+            # better. NB: CR alone is misleading when D is large (K/D tiny),
+            # so the verdict below also gates on the absolute topK fraction.
+            random_baseline = K_diag / self.D_built
+            concentration_ratio = topK_energy_frac / max(random_baseline,
+                                                         1e-12)
 
             # ---- Ring 1: top components by |beta_d| ----
             K = min(ring_components, self.D_built)
@@ -313,11 +323,69 @@ class DFHierExtractor:
             'complete_resid': complete_resid, 'spans_full': spans_full,
             'alpha_norm': alpha_norm, 'beta_norm': beta_norm,
             'topK_energy_frac': topK_energy_frac,
+            'top1_share': top1_share,
+            'concentration_ratio': concentration_ratio,
+            'random_baseline': random_baseline,
             'participation_ratio': participation_ratio,
             'components': comp_list,
             'num_components_total': self.D_built,
             'basis_kind': self.basis_kind, 'block_kind': self.block_kind,
         }
+
+
+# ======================================================================
+# beta-energy verdict  (single source of truth, used by console + figure)
+# ======================================================================
+
+def grade_beta_energy(results: Dict) -> Dict:
+    """Three-tier verdict on whether the basis is well-aligned with alpha.
+
+    Gates on BOTH the absolute top-K energy fraction (tkf) and the
+    concentration ratio vs a random basis (CR). CR alone is misleading: with
+    D=200 a random basis captures only K/D ~ 5% of the energy, so even a
+    mediocre basis scores a large CR. tkf is the honest absolute gate.
+
+      CONCENTRATED : CR >= 8  and tkf >= 0.80
+                     basis well-aligned; the corpus would buy little here.
+      PARTIAL      : CR >= 3  and tkf >= 0.45
+                     mild spread; some Proposition-1 anisotropy -- worth
+                     comparing the 'bn' / 'distill' bases.
+      SPREAD       : otherwise
+                     basis misaligned with alpha; energy spread thin over
+                     many components -- this is exactly the input-patch
+                     anisotropy the corpus corrects (Proposition 1).
+
+    Returns a dict with the tier, a one-line message, and a colour.
+    """
+    tkf = results['topK_energy_frac']
+    cr = results['concentration_ratio']
+    s1 = results['top1_share']
+    pr = results['participation_ratio']
+    basis = results['basis_kind']
+
+    if cr >= 8.0 and tkf >= 0.80:
+        tier = 'CONCENTRATED'
+        color = 'darkgreen'
+        verdict = (f"energy concentrated (basis well-aligned with alpha); "
+                   f"the corpus would buy little for this image.")
+    elif cr >= 3.0 and tkf >= 0.45:
+        tier = 'PARTIAL'
+        color = 'darkorange'
+        verdict = (f"mild spread -- some Proposition-1 anisotropy; "
+                   f"compare the 'bn' / 'distill' bases to see beta "
+                   f"concentrate.")
+    else:
+        tier = 'SPREAD'
+        color = 'firebrick'
+        verdict = (f"energy SPREAD over many components: the '{basis}' basis "
+                   f"is misaligned with alpha (Proposition 1 anisotropy) -- "
+                   f"try 'bn' / 'distill'.")
+
+    msg = (f"||alpha||={results['alpha_norm']:.2e}  "
+           f"||beta||={results['beta_norm']:.2e}  |  "
+           f"top-K energy={100 * tkf:.0f}% (random~{100 * results['random_baseline']:.0f}%, "
+           f"CR={cr:.0f}x)  top-1={100 * s1:.0f}%  PR={pr:.0f}")
+    return {'tier': tier, 'color': color, 'verdict': verdict, 'msg': msg}
 
 
 # ======================================================================
@@ -383,9 +451,10 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                          cy + R1 * np.sin(np.deg2rad(ang)), ang))
 
     # ring 2 positions. Geometry is sized for the default 10 components x 3
-    # channels (30 panels). If the user requests substantially more panels,
+    # channels (30 panels). R2 is kept modest so the top panel clears the
+    # 3-line status banner. If the user requests substantially more panels,
     # they may crowd -- pass smaller --ring_components / --top_channels.
-    R2, CH = 0.385, 0.060
+    R2, CH = 0.370, 0.060
     arc_half = (360.0 / K) * 0.36 if K > 0 else 0.0
     ch_pos = []
     for (fx, fy, fang) in feat_pos:
@@ -482,8 +551,7 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
     # Status banner -- two lines in one box, placed in the clear strip between
     # the header and the topmost ring panel (which reaches y~0.915).
     # Line 1: completeness (the headline data-free claim, Theorem 1).
-    # Line 2: beta-energy diagnostics (is tiny beta harmless or a real
-    #         basis-misalignment signal, Proposition 1).
+    # Line 2: beta-energy diagnostics with the 3-tier verdict (Proposition 1).
     cr = results['complete_resid']
     if results['spans_full']:
         comp_txt = (f"Completeness (D=C, Theorem 1): pre-ReLU residual "
@@ -494,28 +562,15 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                     f"residual is the truncation tail sum_(d>D) beta_d z_d, "
                     f"NOT an identity error.")
 
-    tkf = results['topK_energy_frac']
-    pr = results['participation_ratio']
-    if tkf < 0.5:
-        diag_txt = (f"beta diag: ||alpha||={results['alpha_norm']:.2e}  "
-                    f"||beta||={results['beta_norm']:.2e}  top-{K} comps="
-                    f"{100 * tkf:.0f}% energy  PR={pr:.0f}  -> energy SPREAD: "
-                    f"'{basis_kind}' basis misaligned with alpha "
-                    f"(Prop. 1 anisotropy).")
-        edge_col = 'firebrick'
-    else:
-        diag_txt = (f"beta diag: ||alpha||={results['alpha_norm']:.2e}  "
-                    f"||beta||={results['beta_norm']:.2e}  top-{K} comps="
-                    f"{100 * tkf:.0f}% energy  PR={pr:.0f}  -> concentrated; "
-                    f"small beta reflects small ||alpha|| "
-                    f"(recon cosine is scale-free).")
-        edge_col = 'darkgreen'
+    grade = grade_beta_energy(results)
+    diag_txt = (f"beta diag [{grade['tier']}]: {grade['msg']}\n"
+                f"-> {grade['verdict']}")
 
-    fig.text(0.5, 0.945, comp_txt + '\n' + diag_txt, ha='center',
-             va='center', fontsize=8.8, family='monospace', color='black',
+    fig.text(0.5, 0.937, comp_txt + '\n' + diag_txt, ha='center',
+             va='center', fontsize=8.4, family='monospace', color='black',
              linespacing=1.5,
              bbox=dict(boxstyle='round', facecolor='white',
-                       edgecolor=edge_col, alpha=0.95, linewidth=1.5))
+                       edgecolor=grade['color'], alpha=0.95, linewidth=1.8))
 
     # footer legend
     legend = [
@@ -684,16 +739,14 @@ def main():
     print(f"  ||alpha|| = {results['alpha_norm']:.4e}   "
           f"||beta|| = {results['beta_norm']:.4e}")
     print(f"  top-{args.ring_components} components capture "
-          f"{100 * results['topK_energy_frac']:.1f}% of ||beta||^2 energy")
-    print(f"  participation ratio = {results['participation_ratio']:.1f} "
-          f"effective components (of {results['num_components_total']})")
-    if results['topK_energy_frac'] < 0.5:
-        print(f"  -> beta energy is SPREAD across many components: the "
-              f"'{extractor.basis_kind}' basis is misaligned with alpha "
-              f"(Proposition 1 anisotropy). Try basis='bn' or 'distill'.")
-    elif results['alpha_norm'] < 1e-2:
-        print(f"  -> beta values are small because ||alpha|| is small; "
-              f"this is harmless (recon cosine is scale-invariant).")
+          f"{100 * results['topK_energy_frac']:.1f}% of ||beta||^2 energy "
+          f"(random basis ~ {100 * results['random_baseline']:.1f}%)")
+    print(f"  top-1 share = {100 * results['top1_share']:.1f}%   "
+          f"concentration ratio = {results['concentration_ratio']:.1f}x   "
+          f"participation ratio = {results['participation_ratio']:.1f} "
+          f"(of {results['num_components_total']})")
+    grade = grade_beta_energy(results)
+    print(f"  verdict [{grade['tier']}]: {grade['verdict']}")
 
     save_path = out / (f"dfhier_{stem}_{extractor.model_name}_"
                        f"{extractor.basis_kind}.png")
