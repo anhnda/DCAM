@@ -1,4 +1,4 @@
-python df_decomposition.py --model resnet50 --target_layer layer3 --basis kernel --D 200
+python df_decomposition.py --model resnet50 --target_layer layer3 --basis bn --D 200
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_kernel_D200.pkl --class_id 281 --offset 3
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_distill.pkl --class_id 281 --offset 3
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_bn.pkl  --offset 1 --class_id 101
