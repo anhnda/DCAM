@@ -63,7 +63,7 @@ from collections import defaultdict
 sys.path.append('.')
 # Pull the DCAM module class straight from the training script so the
 # encode/topk/pinv-decode forward is byte-identical to training.
-from run_dcam_full import DCAM, project_rows_to_simplex
+from misc.run_dcam_full import DCAM, project_rows_to_simplex
 from full_classes import IMAGENET2012_CLASSES
 
 import pandas as pd

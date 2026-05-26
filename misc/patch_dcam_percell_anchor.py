@@ -82,7 +82,7 @@ lets one code path run BOTH the baseline and the fix for a clean A/B.
 """
 
 import torch
-from dcam_percell_anchor import build_anchor_percell
+from misc.dcam_percell_anchor import build_anchor_percell
 
 
 def build_dcam_anchor_percell(act_chunks, D, nmf_iters=8000,

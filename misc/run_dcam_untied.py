@@ -88,7 +88,7 @@ import argparse
 sys.path.append('.')
 # Reuse the heavy pieces from the tied DCAM script so we share the activation
 # cache and stay byte-identical on the data side.
-from run_dcam_full import (
+from misc.run_dcam_full import (
     MODEL_CONFIGS,                  # same backbone configs
     set_seed,
     project_rows_to_simplex,

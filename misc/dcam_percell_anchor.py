@@ -83,13 +83,13 @@ from typing import List, Tuple
 from tqdm import tqdm
 
 # Reuse the original simplex projection from DCAM.
-from run_dcam_full import project_rows_to_simplex
+from misc.run_dcam_full import project_rows_to_simplex
 # Reuse the CONVERGING NMF solver from the diagnostic script. This solver
 # rescales the init to S's magnitude and correlation-normalizes S before
 # factorizing -- exactly the two things build_anchor's multiplicative-update
 # NMF lacked, which is why build_anchor's NMF stalled at rel_err ~285 on the
 # (large-magnitude) per-cell S. We must NOT use build_anchor's NMF here.
-from check_anchor_nonnegativity import nmf_symmetric
+from misc.check_anchor_nonnegativity import nmf_symmetric
 
 
 def _merge_near_duplicate_atoms(Pi0: torch.Tensor, merge_tol: float

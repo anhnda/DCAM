@@ -35,7 +35,7 @@ import torch
 import joblib
 from scipy.optimize import linear_sum_assignment
 
-from dcam_percell_anchor import build_anchor_percell
+from misc.dcam_percell_anchor import build_anchor_percell
 
 
 def load_chunks(cache_dir, cache_key):

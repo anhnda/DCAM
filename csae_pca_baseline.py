@@ -86,7 +86,7 @@ import sys
 sys.path.append('.')
 from run_xcsae_full import MultiChannelConvSAE
 # reuse the streamed covariance + device helpers (no transcription drift)
-from csae_svd_anchor import (
+from misc.csae_svd_anchor import (
     build_percell_covariance, resolve_device, torch_dtype,
 )
 

@@ -63,11 +63,11 @@ from collections import defaultdict
 sys.path.append('.')
 # Pull the DCAM module class straight from the training script so the
 # encode/topk/pinv-decode forward is byte-identical to training.
-from run_dcam_full import DCAM, project_rows_to_simplex
+from misc.run_dcam_full import DCAM, project_rows_to_simplex
 # Untied diagnostic variant. Import is best-effort: if the user hasn't created
 # the file yet, fall back gracefully (tied checkpoints will still load fine).
 try:
-    from run_dcam_untied import DCAMUntied
+    from misc.run_dcam_untied import DCAMUntied
     _HAVE_UNTIED = True
 except ImportError:
     DCAMUntied = None

@@ -920,7 +920,7 @@ def main():
 
     # ---- anchor Pi0  (seed-free) ---------------------------------------
     print(f"\n{'='*80}\nBuilding seed-free anchor Pi0\n{'='*80}")
-    from patch_dcam_percell_anchor import build_dcam_anchor_percell
+    from misc.patch_dcam_percell_anchor import build_dcam_anchor_percell
     Pi0, nu, D_eff = build_dcam_anchor_percell(
         act_chunks, D,
         nmf_iters=max(args.nmf_iters, 8000),

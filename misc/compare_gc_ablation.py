@@ -77,7 +77,7 @@ from run_xcsae_full import (
 # Re-use core utilities from the single-checkpoint script if it's on PYTHONPATH;
 # otherwise inline them here for self-containedness.
 try:
-    from eval_topk_stability import (
+    from misc.eval_topk_stability import (
         compute_topk_support, jaccard, estimate_L_f, estimate_L_phi, load_csae,
     )
 except ImportError:

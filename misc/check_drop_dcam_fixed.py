@@ -65,7 +65,7 @@ import io
 from collections import defaultdict
 
 sys.path.append('.')
-from run_dcam_full import DCAM, project_rows_to_simplex
+from misc.run_dcam_full import DCAM, project_rows_to_simplex
 from full_classes import IMAGENET2012_CLASSES
 
 import pandas as pd
