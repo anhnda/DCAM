@@ -81,6 +81,18 @@ Usage
   python df_hier_visualization.py --class_id 281 --offset 3 \\
       --df_basis df_basis_resnet50_layer3_distill_D200.pkl \\
       --ring_components 10 --top_channels 3 --recon_D 50
+
+CHANGELOG
+---------
+  * Architecture dispatch now goes through df_decomposition's BackboneAdapter
+    registry and load_backbone() helper. The hard-coded resnet18/50/vgg16
+    branches in _get_target_layer / _detect_dims are gone -- this file now
+    transparently supports every backbone df_decomposition.MODEL_CONFIGS lists
+    (resnet18/34/50/101/152, wide/ResNeXt, vgg11/13/16/19 +/- BN, densenet,
+    mobilenet_v2/v3, efficientnet_b0..b3, convnext_tiny/small/base).
+  * _detect_dims now uses the SAME forward hook that extract() uses, by
+    running one random forward pass through the FULL backbone. No more
+    manual layer-walking that has to be kept in sync with each new family.
 """
 
 import argparse
@@ -101,8 +113,9 @@ sys.path.append('.')
 from src.gradcam import GradCAM
 from full_classes import IMAGENET2012_CLASSES
 # DataFreeReconstructor must be importable for joblib to unpickle the basis.
+# load_backbone and get_adapter give us architecture-agnostic dispatch.
 from df_decomposition import (DataFreeReconstructor, MODEL_CONFIGS,  # noqa: F401
-                              build_from_weights)
+                              build_from_weights, load_backbone, get_adapter)
 
 
 # Cosine threshold for the per-latent channel-support count.
@@ -236,9 +249,14 @@ class DFHierExtractor:
                   f"D_built={self.D_built}  "
                   f"(weight-derived, corpus-free, seed-stable)")
 
-        self.backbone = MODEL_CONFIGS[self.model_name]['model_fn']() \
-            .to(self.device).eval()
-        self.target_layer = self._get_target_layer()
+        # ---- architecture-agnostic backbone load ----
+        # Use load_backbone() from df_decomposition rather than poking at
+        # MODEL_CONFIGS internals -- this keeps the visualizer working for
+        # every family in the BackboneAdapter registry without code changes.
+        self.backbone = load_backbone(self.model_name).to(self.device).eval()
+        self.adapter = get_adapter(self.model_name)
+        self.target_layer = self.adapter.get_target_module(
+            self.backbone, self.target_layer_name)
         self._detect_dims()
         print(f"  Backbone: {self.model_name} @ {self.target_layer_name} "
               f"({self.num_channels}ch, {self.spatial_size}x"
@@ -257,37 +275,48 @@ class DFHierExtractor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])])
 
-    # -- backbone plumbing (mirrors hier_visualize_pca.py) --------------
-
-    def _get_target_layer(self):
-        if self.model_name in ('resnet50', 'resnet18'):
-            return {'layer1': self.backbone.layer1,
-                    'layer2': self.backbone.layer2,
-                    'layer3': self.backbone.layer3,
-                    'layer4': self.backbone.layer4}[self.target_layer_name]
-        idx = int(self.target_layer_name.split('[')[1].rstrip(']'))
-        return self.backbone.features[idx]
+    # -- backbone plumbing -------------------------------------------
 
     def _detect_dims(self):
-        with torch.no_grad():
-            d = torch.randn(1, 3, 224, 224).to(self.device)
-            if self.model_name in ('resnet50', 'resnet18'):
-                x = self.backbone.conv1(d); x = self.backbone.bn1(x)
-                x = self.backbone.relu(x); x = self.backbone.maxpool(x)
-                x = self.backbone.layer1(x)
-                if 'layer1' not in self.target_layer_name:
-                    x = self.backbone.layer2(x)
-                    if 'layer2' not in self.target_layer_name:
-                        x = self.backbone.layer3(x)
-                        if 'layer3' not in self.target_layer_name:
-                            x = self.backbone.layer4(x)
-            else:
-                idx = int(self.target_layer_name.split('[')[1].rstrip(']'))
-                x = d
-                for i in range(idx + 1):
-                    x = self.backbone.features[i](x)
-            self.num_channels = x.shape[1]
-            self.spatial_size = x.shape[2]
+        """Discover the target layer's output channel count and spatial size
+        by running a single random forward pass through the FULL backbone
+        and reading the tensor caught by a temporary hook on self.target_layer.
+
+        This replaces the previous manual layer-by-layer walk (which only knew
+        about ResNet stages and VGG features). Going through the adapter-found
+        target module + hook makes the dim detection work for every registered
+        architecture (DenseNet, MobileNet, EfficientNet, ConvNeXt, ...)
+        without per-family code.
+        """
+        captured = {}
+        def _hook(module, inp, out):
+            captured['out'] = out.detach()
+        h = self.target_layer.register_forward_hook(_hook)
+        try:
+            with torch.no_grad():
+                d = torch.randn(1, 3, 224, 224, device=self.device)
+                self.backbone(d)
+        finally:
+            h.remove()
+        if 'out' not in captured:
+            raise RuntimeError(
+                f"Target layer '{self.target_layer_name}' was not visited "
+                f"during the forward pass; check that the adapter "
+                f"({type(self.adapter).__name__}) returns the right module.")
+        x = captured['out']
+        if x.dim() != 4:
+            raise RuntimeError(
+                f"Target layer output is not a 4D tensor (got shape "
+                f"{tuple(x.shape)}); the radial visualization expects "
+                f"[N, C, H, W] feature maps.")
+        self.num_channels = x.shape[1]
+        # Some architectures use non-square feature maps in weird stages; we
+        # still report a single spatial_size in headers/prints, but compute it
+        # from H so the visualizer keeps working on rectangular maps.
+        self.spatial_size = x.shape[2]
+        if x.shape[2] != x.shape[3]:
+            print(f"  Note: target layer output is {x.shape[2]}x{x.shape[3]} "
+                  f"(non-square); displays will use H={x.shape[2]}.")
 
     def _save_act(self, module, inp, out):
         self.layer_activations = out.detach()
