@@ -1,8 +1,8 @@
 python df_decomposition.py --model resnet50 --target_layer layer3 --basis bn --D 200
 # good quality, ~2-3 min
-python df_decomposition.py --model resnet50 --target_layer layer3 \
+python df_decomposition.py --model resnet50 --target_layer layer4 \
     --basis distill --D 200 \
-    --distill_batches 8 --distill_bs 16 --distill_iters 1000 \
+    --distill_batches 8 --distill_bs 16 --distill_iters 100 \
     --distill_harvest_passes 4 --distill_harvest_bs 64
 
 # publication-grade, ~10 min
@@ -13,8 +13,12 @@ python df_decomposition.py --model resnet50 --target_layer layer3 \
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_kernel_D200.pkl --class_id 281 --offset 3
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_distill.pkl --class_id 281 --offset 3
 python df_hier_visualization.py  --df_basis df_basis_resnet50_layer3_bn_D200.pkl  --offset 1 --class_id 101
-python df_hier_visualization.py  --pca  --offset 1 --class_id 101
+python df_hier_visualization.py  --pca  --offset 1 --class_id 101 --target_layer 3
 python df_decomposition.py --model resnet50 --target_layer layer3 --basis distill --D 200
+
+python df_hier_visualization.py  --df_basis df_basis_resnet50_layer4_distill_D200.pkl  --offset 1 --class_id 101
+python df_hier_visualization.py  --pca  --offset 1 --class_id 101 --target_layer layer4
+
 
     df_basis_resnet50_layer3_distill.pkl
 python df_hier_visualization.py --image cat.jpg --df_basis df_basis_resnet50_layer3_kernel_D200.pkl
