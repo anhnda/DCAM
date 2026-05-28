@@ -83,7 +83,7 @@ from run_xcsae_full import MultiChannelConvSAE
 from csae_pca_baseline import PCAReconstructor   # noqa: F401 (pickle import)
 from src.gradcam import GradCAM
 from full_classes import IMAGENET2012_CLASSES
-
+from stable_sparse_pca import SparsePCAReconstructor    # noqa: F401 (pickle import)
 
 # Cosine threshold for the per-latent channel-support counts (Nz, Nv).
 COS_TARGET = 0.95
