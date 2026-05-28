@@ -25,6 +25,22 @@ Layout
     |beta_d|. Each panel shows the SIGNED contribution map beta_d * z_d
     (blue = pushes Grad-CAM up, red = down), with v{d} and beta_d.
 
+    Each panel is now scaled to its OWN max so the component's spatial
+    structure is legible, but the title still carries the GLOBAL weighting
+    info (beta_d and its share of the total |beta|^2 energy) so you can read
+    how much each panel contributes to the center sum even though the colour
+    scales differ panel-to-panel.
+
+    Each panel title also reports the per-latent CHANNEL SUPPORT (ported from
+    df_hier_visualization.py):
+        Nz=<m> ch -> 95%   m = smallest number of channels (added most-
+                           significant first by |v_{d,c}|) whose partial sum
+                           reconstructs the full z_d MAP to >= 95% spatial
+                           cosine. IMAGE-conditional (depends on A(x)).
+        (Nv=<m'>)          m' = channels needed for the LOADING vector v_d to
+                           reach 95% of its OWN energy. INTRINSIC to the basis
+                           (image-independent).
+
   RING 2  (per-component channel loadings, default 4 "petals")
     For each component v_d, its top-N channels by |v_{d,c}| -- i.e. which
     backbone channels COMPOSE that deterministic direction. Dashed lines:
@@ -67,6 +83,10 @@ from run_xcsae_full import MultiChannelConvSAE
 from csae_pca_baseline import PCAReconstructor   # noqa: F401 (pickle import)
 from src.gradcam import GradCAM
 from full_classes import IMAGENET2012_CLASSES
+
+
+# Cosine threshold for the per-latent channel-support counts (Nz, Nv).
+COS_TARGET = 0.95
 
 
 MODEL_CONFIGS = {
@@ -227,16 +247,60 @@ class HierPCAExtractor:
             tot = L_tilde.abs().sum().clamp(min=1e-8)
             relu_keep_frac = float((pos / tot).item())
 
+            # ---- global beta-energy bookkeeping (for the weighting labels) ----
+            # Each ring-1 panel is scaled to its own max, so the colour bar no
+            # longer encodes magnitude. We carry the GLOBAL weight per panel as
+            # (a) beta_d itself, and (b) its share of total ||beta||^2 energy,
+            # so the reader can still tell how much each panel feeds the center
+            # sum despite the per-panel scaling.
+            beta_sq = beta ** 2
+            beta_sq_total = float(beta_sq.sum().clamp(min=1e-12).item())
+
             # Ring 1: top components by |beta_d|
             K = min(ring_components, self.D_built)
             order = torch.argsort(beta.abs(), descending=True)[:K]
 
             comp_list: List[Dict] = []
+            nz_list, nv_list = [], []
             for d_t in order:
                 d = int(d_t.item())
                 b = float(beta[d].item())
                 cmap = comp[d].cpu()                              # signed contribution
                 v_d = self.V_full[:, d]                          # [C] eigenvector loadings
+
+                # global weighting info for this panel
+                energy_share = float(beta_sq[d].item() / beta_sq_total)
+
+                # ============================================================
+                # PER-LATENT CHANNEL SUPPORT (Nz, Nv) -- ported from
+                # df_hier_visualization.py.
+                #   Nz = # channels (added most-significant first by |v_{d,c}|)
+                #        whose partial sum rebuilds the z_d MAP to >=95% cosine.
+                #        Image-conditional (uses centered activations).
+                #   Nv = # channels for the loading vector v_d to reach 95% of
+                #        its own L2 energy. Intrinsic to the basis.
+                # ============================================================
+                order_ch = torch.argsort(v_d.abs(), descending=True)  # [C]
+
+                z_d_full = z[d].reshape(-1)                       # [HW]
+                z_norm = z_d_full.norm().clamp(min=1e-12)
+                # cumulative partial-sum maps, channels added most-significant first
+                terms = centered[:, order_ch] * v_d[order_ch].view(1, -1)  # [HW,C]
+                z_cum = torch.cumsum(terms, dim=1)                # [HW,C]
+                cos_cum = (z_cum * z_d_full.view(-1, 1)).sum(dim=0) \
+                    / (z_cum.norm(dim=0).clamp(min=1e-12) * z_norm)
+                hit_z = (cos_cum >= COS_TARGET).nonzero()
+                n_ch_z = (int(hit_z[0].item()) + 1) if hit_z.numel() > 0 else C
+
+                v_sq_sorted = (v_d[order_ch] ** 2)
+                v_cum = torch.cumsum(v_sq_sorted, dim=0)
+                v_total = v_cum[-1].clamp(min=1e-12)
+                hit_v = ((v_cum / v_total) >= COS_TARGET).nonzero()
+                n_ch_v = (int(hit_v[0].item()) + 1) if hit_v.numel() > 0 else C
+
+                nz_list.append(n_ch_z)
+                nv_list.append(n_ch_v)
+
                 mag = v_d.abs()
                 n_in = min(top_channels, mag.numel())
                 _, top_ch = torch.topk(mag, k=n_in)
@@ -248,7 +312,9 @@ class HierPCAExtractor:
                     channels.append({'ch_id': ch_id, 'loading': loading,
                                      'map': ch_map})
                 comp_list.append({'comp_id': d, 'beta': b,
-                                  'contrib_map': cmap, 'channels': channels})
+                                  'energy_share': energy_share,
+                                  'contrib_map': cmap, 'channels': channels,
+                                  'n_ch_z': n_ch_z, 'n_ch_v': n_ch_v})
 
         true_class = list(IMAGENET2012_CLASSES.values())[label]
         pred_class = list(IMAGENET2012_CLASSES.values())[pred_label]
@@ -261,6 +327,11 @@ class HierPCAExtractor:
             'relu_keep_frac': relu_keep_frac,
             'components': comp_list,
             'num_components_total': self.D_built,
+            'C_channels': self.C,
+            'nz_median': int(np.median(nz_list)) if nz_list else 0,
+            'nv_median': int(np.median(nv_list)) if nv_list else 0,
+            'nz_range': (min(nz_list), max(nz_list)) if nz_list else (0, 0),
+            'nv_range': (min(nv_list), max(nv_list)) if nv_list else (0, 0),
         }
 
 
@@ -297,6 +368,7 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
     recon_D = results['recon_D']
     comps = results['components']
     correct = results['correct']
+    C_channels = results['C_channels']
 
     K = len(comps)
     N = len(comps[0]['channels']) if K > 0 else 0
@@ -363,19 +435,25 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
                  fontsize=9, fontweight='bold', color=rc)
     _set_border(ax, rc, 2.0)
 
-    # Ring 1: signed component contributions beta_d * z_d (shared diverging scale)
-    if K > 0:
-        cmax = max(float(c['contrib_map'].abs().max()) for c in comps)
-        cmax = cmax if cmax > 1e-8 else 1.0
-    else:
-        cmax = 1.0
+    # Ring 1: signed component contributions beta_d * z_d.
+    # CHANGED: each panel is now scaled to its OWN max (per-panel diverging
+    # scale) so the component's spatial structure is legible regardless of its
+    # absolute magnitude. The GLOBAL weighting that determines the center sum
+    # is preserved in the title (beta_d and its energy share of ||beta||^2),
+    # so a small-magnitude-but-structured component reads clearly while still
+    # advertising that it barely moves the center reconstruction.
     for k, (fx, fy, _) in enumerate(feat_pos):
         c = comps[k]
+        cmap_arr = c['contrib_map'].numpy()
+        local_max = float(np.abs(cmap_arr).max())
+        local_max = local_max if local_max > 1e-12 else 1.0
         ax = _add_inset(fig, fx, fy, F1, F1)
-        ax.imshow(c['contrib_map'].numpy(), cmap='bwr',
-                  vmin=-cmax, vmax=cmax, interpolation='bilinear')
-        ax.set_title(f"v{c['comp_id']}\nbeta={c['beta']:+.2f}",
-                     fontsize=8, fontweight='bold')
+        ax.imshow(cmap_arr, cmap='bwr', vmin=-local_max, vmax=local_max,
+                  interpolation='bilinear')
+        ax.set_title(f"v{c['comp_id']}  beta={c['beta']:+.2f} "
+                     f"({100 * c['energy_share']:.0f}%)\n"
+                     f"Nz={c['n_ch_z']}ch->95%  (Nv={c['n_ch_v']})",
+                     fontsize=7.5, fontweight='bold')
         _set_border(ax, 'royalblue' if c['beta'] >= 0 else 'firebrick', 1.5)
 
     # Ring 2: channel loadings of each eigenvector
@@ -406,10 +484,18 @@ def build_radial_figure(results: Dict, model_name: str, target_layer: str,
         f"Grad-CAM | rank-{recon_D} reconstruction (EXACT pair, cos={recon_cos:.3f}, "
         f"ReLU keeps {100*results['relu_keep_frac']:.0f}% of pre-ReLU mass).",
         f"Ring 1: top-{K} components by |beta_d| (of {results['num_components_total']}); "
-        f"signed contribution beta_d*z_d (blue +, red -). Components are "
-        f"DETERMINISTIC and class-shared; only beta_d is image/class-specific.",
+        f"signed contribution beta_d*z_d (blue +, red -), each panel scaled to "
+        f"its OWN max for legibility. Title beta_d ((share)% of ||beta||^2) is the "
+        f"GLOBAL weight feeding the center sum. Components are DETERMINISTIC and "
+        f"class-shared; only beta_d is image/class-specific.",
+        f"Ring 1 title Nz = # channels (of C={C_channels}) to rebuild that z_d "
+        f"MAP to >=95% cos (the 'sum' the {N}-panel ring 2 can't show); "
+        f"Nv = # channels for the loading's 95% energy. "
+        f"Across shown comps: Nz median={results['nz_median']} "
+        f"range={results['nz_range']}; Nv median={results['nv_median']} "
+        f"range={results['nv_range']}.",
         f"Ring 2: top-{N} channel loadings v_(d,c) per component "
-        f"(green = positive, red = negative).",
+        f"(green = positive, red = negative); a tiny subset of the Nz channels.",
     ]
     fig.text(0.5, 0.03, '\n'.join(legend), ha='center', va='bottom',
              fontsize=10, family='monospace',
@@ -468,6 +554,19 @@ def main():
     results = extractor.extract(
         image, label=args.class_id, ring_components=args.ring_components,
         top_channels=args.top_channels, recon_D=args.recon_D)
+
+    # ---- per-latent channel support summary (console) ----
+    print(f"  rank-{results['recon_D']} recon cosine: {results['recon_cos']:.4f}")
+    print(f"  --- per-latent channel support (of C={results['C_channels']} "
+          f"channels), shown components ---")
+    print(f"  Nz (rebuild z_d map >=95% cos): median="
+          f"{results['nz_median']}ch  range={results['nz_range']}")
+    print(f"  Nv (loading 95% energy):        median="
+          f"{results['nv_median']}ch  range={results['nv_range']}")
+    for c in results['components']:
+        print(f"    v{c['comp_id']:<4d} beta={c['beta']:+.4f} "
+              f"({100 * c['energy_share']:5.1f}% energy)  "
+              f"Nz={c['n_ch_z']:>4d}ch -> 95% cos   Nv={c['n_ch_v']:>4d}ch")
 
     save_path = out / (f"hierpca_class{args.class_id}_img{idx}_{args.model}.png")
     build_radial_figure(results, args.model, args.target_layer,
