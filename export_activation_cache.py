@@ -705,7 +705,7 @@ def main():
         force_resample=args.force_resample,
     )
     data_loader = DataLoader(dataset, batch_size=BATCH_SIZE_COLLECTION,
-                             shuffle=False, num_workers=0)
+                             shuffle=False, num_workers=4)
 
     extractor = ActivationExtractor(
         model_name=args.model,
