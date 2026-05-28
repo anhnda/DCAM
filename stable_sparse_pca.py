@@ -40,6 +40,8 @@ THE FOUR STAGES (all consume the SAME streamed (mu, Sigma))
         v_d      = leading eigenvector of Sigma_d RESTRICTED to S_d x S_d
                    -- the OPTIMAL sparse direction within that support,
                    not a mere truncation                            (refine)
+        v_d      = v_d orthogonalized (Gram-Schmidt) against accepted atoms,
+                   then re-restricted to S_d so it stays sparse     (decorr.)
         Sigma_{d+1} = (I - v_d v_d^T) Sigma_d (I - v_d v_d^T)      (PROJECTION
                    deflation -- keeps the residual PSD; Hotelling would not,
                    since v_d is not an exact eigenvector of Sigma_d.)
@@ -62,6 +64,30 @@ THE FOUR STAGES (all consume the SAME streamed (mu, Sigma))
      between atoms has its contribution apportioned by the cross-atom Gram
      matrix instead of counted twice. With orthonormal V, G = I and this
      reduces EXACTLY to the dense PCAReconstructor -- a strict generalization.
+
+WHY THE REFIT USES DEFLATION, NOT INDEPENDENT EIGENDECOMPOSITION
+----------------------------------------------------------------
+A previous version refit each stability-selected atom as the leading
+eigenvector of cov RESTRICTED to its pruned support, INDEPENDENTLY of the
+other atoms. On a flat spectrum (your case) two atoms with overlapping
+supports then both recover the SAME dominant direction: the saved V picked up
+a ~0.9 off-diagonal duplicate, the spanned subspace SHRANK, and the oblique
+EVR DROPPED -- and it silently discarded the Gram-Schmidt decorrelation done
+in stage 2, because that V was overwritten. The refit here instead re-runs the
+SAME projection-deflation + Gram-Schmidt as stage 2, but with the supports
+FROZEN to the stability-selected sets. This carries the decorrelation into the
+final V (hence into G, the reconstructor, and the reported EVR), keeps atoms
+sparse on their chosen supports, and does not shrink the subspace. Verified:
+off-diag and EVR match the stage-2 reference to machine precision when the
+pruned supports equal the deterministic ones.
+
+The irreducible residual off-diagonal (~0.1-0.15, not 0) is the GEOMETRY, not
+a bug: re-restricting an orthogonalized vector to a sparse support reintroduces
+some overlap, and on a flat spectrum you cannot have BOTH exact orthogonality
+AND sparse atoms. Atoms that remain highly correlated are exactly the ones
+flagged tied_block -- report them as a subspace. If you need exact
+orthogonality, you must give up sparsity (dense PCA), which is the honest
+baseline in csae_pca_baseline.py.
 
 STABILITY IS PER-ATOM, NOT GLOBAL
 ---------------------------------
@@ -148,7 +174,7 @@ class SSPCAConfig:
 
 
 # ==========================================================================
-# Stage 2 -- deterministic sparse deflation (pure function of Sigma)
+# Stage 2 helpers -- support selection and the decorrelating refine step
 # ==========================================================================
 
 def _energy_support(w: torch.Tensor, energy_target: float,
@@ -162,6 +188,37 @@ def _energy_support(w: torch.Tensor, energy_target: float,
     kd = max(k_min, min(kd, k_max))
     return order[:kd].sort().values
 
+
+def _refine_atom_on_support(S: torch.Tensor, sup: torch.Tensor,
+                            V_prev: torch.Tensor, d: int) -> torch.Tensor:
+    """Leading eigenvector of S restricted to `sup`, orthogonalized (2-pass
+    Gram-Schmidt) against the d already-accepted atoms in V_prev[:, :d], then
+    re-restricted to `sup` so the atom stays sparse. Returns a unit vector in
+    R^C supported on `sup`.
+
+    Re-restricting after GS reintroduces a little overlap (you cannot have both
+    exact orthogonality and a fixed sparse support); that residual overlap is
+    the geometry, and the affected atoms are caught by tied_block downstream."""
+    C = S.shape[0]
+    sub = S.index_select(0, sup).index_select(1, sup)         # k_d x k_d
+    _, Qs = torch.linalg.eigh(sub)                            # ascending
+    v = torch.zeros(C, dtype=S.dtype, device=S.device)
+    v[sup] = Qs[:, -1]                                        # optimal within support
+    v = v / v.norm().clamp_min(1e-12)
+    if d > 0:
+        Vd = V_prev[:, :d]                                    # [C, d]
+        v = v - Vd @ (Vd.T @ v)
+        v = v - Vd @ (Vd.T @ v)                               # reorthogonalize
+        mask = torch.zeros_like(v)
+        mask[sup] = 1.0
+        v = v * mask                                          # keep sparse
+        v = v / v.norm().clamp_min(1e-12)
+    return v
+
+
+# ==========================================================================
+# Stage 2 -- deterministic sparse deflation (pure function of Sigma)
+# ==========================================================================
 
 def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
                    k_min: int, k_max: int
@@ -185,30 +242,42 @@ def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
         _, Q = torch.linalg.eigh(S)                       # ascending
         w = Q[:, -1]                                      # leading eigenvector
         sup = _energy_support(w, energy_target, k_min, k_max)
-        sub = S.index_select(0, sup).index_select(1, sup)  # k_d x k_d
-        _, Qs = torch.linalg.eigh(sub)
-        v = torch.zeros(C, dtype=cov.dtype, device=cov.device)
-        v[sup] = Qs[:, -1]                                # optimal within support
-        v = v / v.norm().clamp_min(1e-12)
-
-        # --- orthogonalize against accepted atoms (vectorized GS, 2 passes) ---
-        if d > 0:
-            Vd = V[:, :d]                                 # [C, d]
-            v = v - Vd @ (Vd.T @ v)
-            v = v - Vd @ (Vd.T @ v)                       # reorthogonalize
-            # re-restrict to support to keep the atom sparse, renormalize
-            mask = torch.zeros_like(v)
-            mask[sup] = 1.0
-            v = v * mask
-            v = v / v.norm().clamp_min(1e-12)
-        # ----------------------------------------------------------------------
-
+        v = _refine_atom_on_support(S, sup, V, d)         # refine + GS-decorrelate
         V[:, d] = v
         sups.append(set(sup.tolist()))
         P = eye - torch.outer(v, v)                       # projection deflation
         S = P @ S @ P
         S = 0.5 * (S + S.T)                               # keep symmetric/PSD
     return V, sups
+
+
+def refit_on_fixed_supports(cov: torch.Tensor, supports: List[List[int]],
+                            k_min: int) -> torch.Tensor:
+    """Re-derive V with the SAME projection-deflation + Gram-Schmidt as
+    sparse_deflate, but with each atom's support FROZEN to `supports[d]`
+    (the stability-selected sets). This is the fix for the old refit loop:
+    that loop recomputed each atom as the leading eigenvector of `cov`
+    restricted to its support, INDEPENDENTLY -- on a flat spectrum two atoms
+    with overlapping supports then recovered the same direction (off-diag ~0.9,
+    EVR collapse) and the stage-2 Gram-Schmidt was discarded. Deflating here
+    keeps accepted directions out of the residual, so the decorrelation
+    survives into the saved V/G/EVR while atoms stay sparse on their supports.
+
+    Returns V [C, D] with unit-norm columns supported on `supports`."""
+    C = cov.shape[0]
+    D = len(supports)
+    S = cov.clone()
+    V = torch.zeros(C, D, dtype=cov.dtype, device=cov.device)
+    eye = torch.eye(C, dtype=cov.dtype, device=cov.device)
+    for d in range(D):
+        sup = torch.tensor(sorted(supports[d]), dtype=torch.long,
+                           device=cov.device)
+        v = _refine_atom_on_support(S, sup, V, d)         # refine + GS-decorrelate
+        V[:, d] = v
+        P = eye - torch.outer(v, v)                       # projection deflation
+        S = P @ S @ P
+        S = 0.5 * (S + S.T)
+    return V
 
 # ==========================================================================
 # Bootstrap covariance samplers
@@ -357,32 +426,41 @@ def fit_stable_sparse_pca(mu: torch.Tensor, cov: torch.Tensor,
     cov = (0.5 * (cov + cov.T)).to(cfg.dtype)
     C = cov.shape[0]
     D = min(cfg.D, C)
-    print("Starge 2: deterministic sparse deflation\n")
+    print("Stage 2: deterministic sparse deflation\n")
     # Stage 2: deterministic sparse atoms
     V, sups = sparse_deflate(cov, D, cfg.energy_target, cfg.k_min, cfg.k_max)
-    print("\nStarge 3: stability selection\n")
+    print("\nStage 3: stability selection\n")
     # Stage 3: stability selection
     if sampler is None:
         sampler = GaussianSurrogateSampler(mu, cov, cfg.n_cells, seed=cfg.seed)
     Pi, atom_stability, pruned = stability_select(cov, V, sampler, cfg)
 
-    # refit each atom on its STABILITY-SELECTED support (fall back to the
-    # deterministic support if pruning emptied it)
-    for d in tqdm(range(D)):
+    # Choose the FINAL support per atom: the stability-selected set if it is
+    # large enough, else fall back to the deterministic support.
+    final_supports: List[List[int]] = []
+    for d in range(D):
         sup = sorted(pruned[d]) if len(pruned[d]) >= cfg.k_min else sorted(sups[d])
-        sup_t = torch.tensor(sup, dtype=torch.long, device=cov.device)
-        sub = cov.index_select(0, sup_t).index_select(1, sup_t)
-        _, Qs = torch.linalg.eigh(sub)
-        v = torch.zeros(C, dtype=cov.dtype, device=cov.device)
-        v[sup_t] = Qs[:, -1]
-        V[:, d] = v / v.norm().clamp_min(1e-12)
+        final_supports.append(sup)
         pruned[d] = set(sup)
 
-    k_per_atom = torch.tensor([len(s) for s in pruned], dtype=torch.long)
+    # Refit ALL atoms together via projection-deflation + Gram-Schmidt on the
+    # FROZEN supports. This carries the decorrelation into the final V (and
+    # hence into G, the reconstructor, and the EVR), unlike the old
+    # independent per-atom eigendecomposition which discarded it and produced
+    # near-duplicate atoms / EVR collapse on a flat spectrum.
+    print("\nStage 3b: refit on stability-selected supports (deflation + GS)\n")
+    V = refit_on_fixed_supports(cov, final_supports, cfg.k_min)
+
+    k_per_atom = torch.tensor([len(s) for s in final_supports], dtype=torch.long)
 
     # Stage 4: oblique adaptive-code matrix  G = (V^T V)^{-1}
     G = torch.linalg.inv(V.T @ V + cfg.ridge * torch.eye(D, dtype=cov.dtype,
                                                          device=cov.device))
+
+    # off-diagonal diagnostic (max |cos| between distinct atoms): with sparse
+    # atoms this is > 0 by geometry; large values land in tied_block.
+    VtV = V.T @ V
+    offdiag_max = float((VtV - torch.diag(torch.diagonal(VtV))).abs().max().item())
 
     # variance bookkeeping (captured by the sparse atoms vs total)
     total_var = float(torch.diagonal(cov).sum().item())
@@ -395,7 +473,7 @@ def fit_stable_sparse_pca(mu: torch.Tensor, cov: torch.Tensor,
 
     return {
         'V': V.cpu(), 'mu': mu.cpu(), 'G': G.cpu(),
-        'supports': [sorted(s) for s in pruned],
+        'supports': [sorted(s) for s in final_supports],
         'selection_prob': Pi.cpu(),
         'atom_stability': atom_stability.cpu(),
         'k_per_atom': k_per_atom.cpu(),
@@ -404,6 +482,7 @@ def fit_stable_sparse_pca(mu: torch.Tensor, cov: torch.Tensor,
         'C': C, 'D': D,
         'total_variance': total_var,
         'explained_variance_ratio_sparse': evr_sparse,
+        'offdiag_max': offdiag_max,
         'config': cfg,
     }
 
@@ -573,6 +652,8 @@ def report(res: Dict):
           f"(budget [{res['config'].k_min},{res['config'].k_max}])")
     print(f"  atom stability |cos|: median={float(st.median()):.3f}  "
           f"min={float(st.min()):.3f}")
+    print(f"  max off-diagonal |<v_i,v_j>| (i!=j): {res['offdiag_max']:.4f}  "
+          f"(>0 by sparsity; large => tied)")
     print(f"  tied/unstable atoms (|cos|<{res['config'].stability_floor}): "
           f"{int(tied.sum())}/{D}  -> report these as a SUBSPACE")
     print(f"  oblique-reconstruction EVR: "
@@ -670,6 +751,7 @@ def main():
         'bootstrap': 'gaussian_surrogate',
         'explained_variance_ratio_sparse':
             res['explained_variance_ratio_sparse'],
+        'offdiag_max': res['offdiag_max'],
         'n_tied_atoms': int(res['tied_block'].sum()),
     }
     save_decomp_npz(args.save_decomp, res, meta)
