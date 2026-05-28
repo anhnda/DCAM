@@ -505,38 +505,72 @@ class ActivationExtractor:
         print(f"  Output: {cache_dir}")
 
         for images, labels in tqdm(data_loader, desc="Extracting"):
-            for i in range(images.size(0)):
-                image = images[i:i+1].to(self.device)
-                label = labels[i:i+1]
-
+            if self.skip_grad:
+                # Fast path: run the whole batch through the model in one shot.
+                # The forward hook fills self.activations for the full batch;
+                # we slice per image afterward. Numerically identical to the
+                # batch-of-1 path -- the hook captures the same tensor either
+                # way -- but with ~1/batch_size the GPU launch overhead.
+                batch = images.to(self.device)
                 with torch.no_grad():
-                    _ = self.model(image)
-                    activations = self.activations.clone()
+                    _ = self.model(batch)
+                    batch_acts = self.activations.cpu()      # [B, C, H, W]
 
-                if self.skip_grad:
+                for i in range(batch.size(0)):
+                    activations = batch_acts[i:i+1]          # [1, C, H, W]
+                    label = labels[i:i+1]
+
                     channel_mask, num_selected, gradcam_map = \
                         self._neutral_mask_and_map()
-                else:
+                    channel_selection_stats.append(num_selected)
+
+                    chunk_activations.append(activations)
+                    chunk_masks.append(channel_mask.cpu())
+                    chunk_labels.append(label)
+                    chunk_gradcams.append(gradcam_map.cpu().unsqueeze(0))
+                    total_processed += 1
+
+                    if len(chunk_activations) >= chunk_size:
+                        chunk_idx = self._flush_chunk(
+                            cache_key, chunk_idx,
+                            chunk_activations, chunk_masks,
+                            chunk_labels, chunk_gradcams,
+                            normalize)
+                        chunk_activations, chunk_masks = [], []
+                        chunk_labels, chunk_gradcams = [], []
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+            else:
+                # GradCAM path: needs per-image backprop, so process one at a
+                # time exactly as before.
+                for i in range(images.size(0)):
+                    image = images[i:i+1].to(self.device)
+                    label = labels[i:i+1]
+
+                    with torch.no_grad():
+                        _ = self.model(image)
+                        activations = self.activations.clone()
+
                     channel_mask, num_selected, gradcam_map = \
                         self._select_channels_and_gradcam_map(image)
-                channel_selection_stats.append(num_selected)
+                    channel_selection_stats.append(num_selected)
 
-                chunk_activations.append(activations.cpu())
-                chunk_masks.append(channel_mask.cpu())
-                chunk_labels.append(label)
-                chunk_gradcams.append(gradcam_map.cpu().unsqueeze(0))
-                total_processed += 1
+                    chunk_activations.append(activations.cpu())
+                    chunk_masks.append(channel_mask.cpu())
+                    chunk_labels.append(label)
+                    chunk_gradcams.append(gradcam_map.cpu().unsqueeze(0))
+                    total_processed += 1
 
-                if len(chunk_activations) >= chunk_size:
-                    chunk_idx = self._flush_chunk(
-                        cache_key, chunk_idx,
-                        chunk_activations, chunk_masks,
-                        chunk_labels, chunk_gradcams,
-                        normalize)
-                    chunk_activations, chunk_masks = [], []
-                    chunk_labels, chunk_gradcams = [], []
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    if len(chunk_activations) >= chunk_size:
+                        chunk_idx = self._flush_chunk(
+                            cache_key, chunk_idx,
+                            chunk_activations, chunk_masks,
+                            chunk_labels, chunk_gradcams,
+                            normalize)
+                        chunk_activations, chunk_masks = [], []
+                        chunk_labels, chunk_gradcams = [], []
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
         if len(chunk_activations) > 0:
             chunk_idx = self._flush_chunk(
