@@ -86,7 +86,7 @@ USAGE
       --model resnet50 --target_layer layer3 --k 128 \
       --images_per_class 50 --device cuda \
       --save fft_basics_resnet50_k128_model.pkl \
-      --save_fft fft_resnet50_layer3_k128.npz
+      --save_fft fft_resnet50_layer3_k128.npz --desc_transform log1p
 ap.add_argument('--desc_transform', type=str, default='none',
                   choices=['none', 'log', 'log_nodc', 'radial_ramp', 'highpass'],
                   help="Rebalance |FFT| before clustering. none=raw; "
