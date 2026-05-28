@@ -113,6 +113,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 import joblib
 
 try:
@@ -348,7 +349,7 @@ def fit_stable_sparse_pca(mu: torch.Tensor, cov: torch.Tensor,
 
     # refit each atom on its STABILITY-SELECTED support (fall back to the
     # deterministic support if pruning emptied it)
-    for d in range(D):
+    for d in tqdm(range(D)):
         sup = sorted(pruned[d]) if len(pruned[d]) >= cfg.k_min else sorted(sups[d])
         sup_t = torch.tensor(sup, dtype=torch.long, device=cov.device)
         sub = cov.index_select(0, sup_t).index_select(1, sup_t)
