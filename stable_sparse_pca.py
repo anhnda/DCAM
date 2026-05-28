@@ -174,7 +174,7 @@ def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
     V = torch.zeros(C, D, dtype=cov.dtype, device=cov.device)
     sups: List[set] = []
     eye = torch.eye(C, dtype=cov.dtype, device=cov.device)
-    for d in range(D):
+    for d in tqdm(range(D)):
         _, Q = torch.linalg.eigh(S)                       # ascending
         w = Q[:, -1]                                      # leading eigenvector
         sup = _energy_support(w, energy_target, k_min, k_max)
@@ -338,10 +338,10 @@ def fit_stable_sparse_pca(mu: torch.Tensor, cov: torch.Tensor,
     cov = (0.5 * (cov + cov.T)).to(cfg.dtype)
     C = cov.shape[0]
     D = min(cfg.D, C)
-
+    print("Starge 2: deterministic sparse deflation\n")
     # Stage 2: deterministic sparse atoms
     V, sups = sparse_deflate(cov, D, cfg.energy_target, cfg.k_min, cfg.k_max)
-
+    print("\nStarge 3: stability selection\n")
     # Stage 3: stability selection
     if sampler is None:
         sampler = GaussianSurrogateSampler(mu, cov, cfg.n_cells, seed=cfg.seed)
