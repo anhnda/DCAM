@@ -174,7 +174,7 @@ def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
     V = torch.zeros(C, D, dtype=cov.dtype, device=cov.device)
     sups: List[set] = []
     eye = torch.eye(C, dtype=cov.dtype, device=cov.device)
-    for d in tqdm(range(D)):
+    for d in range(D):
         _, Q = torch.linalg.eigh(S)                       # ascending
         w = Q[:, -1]                                      # leading eigenvector
         sup = _energy_support(w, energy_target, k_min, k_max)
@@ -303,7 +303,7 @@ def stability_select(cov: torch.Tensor, V_ref: torch.Tensor,
     C, D = V_ref.shape
     Pi = torch.zeros(C, D, dtype=cov.dtype, device=cov.device)
     atom_cos = torch.zeros(D, dtype=cov.dtype, device=cov.device)
-    for _ in range(cfg.n_boot):
+    for _ in tqdm(range(cfg.n_boot)):
         _, cov_b = sampler()
         cov_b = cov_b.to(device=cov.device, dtype=cov.dtype)
         V_b, sup_b = sparse_deflate(cov_b, D, cfg.energy_target,
