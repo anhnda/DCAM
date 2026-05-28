@@ -87,7 +87,12 @@ USAGE
       --images_per_class 50 --device cuda \
       --save fft_basics_resnet50_k128_model.pkl \
       --save_fft fft_resnet50_layer3_k128.npz
-
+ap.add_argument('--desc_transform', type=str, default='none',
+                  choices=['none', 'log', 'log_nodc', 'radial_ramp', 'highpass'],
+                  help="Rebalance |FFT| before clustering. none=raw; "
+                       "log=log1p; log_nodc=log+drop DC; radial_ramp=soft "
+                       "high-pass; highpass=hard high-pass (see --hp_radius).")
+   
   # overlapping basics via NMF, rotation-invariant radial descriptor
   python export_fft_basics.py --model resnet50 --k 64 \
       --cluster nmf --descriptor radial \
