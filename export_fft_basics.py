@@ -664,25 +664,84 @@ def radial_profile_bins(H: int, W: int, n_rbin: int, device='cpu'):
     return idx_flat, counts.clamp_min(1.0)
 
 
-def build_descriptor(fft_mean: torch.Tensor, mode: str,
-                     n_rbin: int) -> Tuple[torch.Tensor, str]:
-    """fft_mean: [C, H, W] mean magnitude spectrum (fftshifted).
-    Returns (descriptor [C, n_feat], human-readable feature description)."""
+ 
+def _radius_grid(H: int, W: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Distance-from-center grid for an fftshifted HxW spectrum, plus its max."""
+    cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=device),
+        torch.arange(W, dtype=torch.float32, device=device),
+        indexing='ij')
+    r = torch.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)            # [H,W]
+    return r, r.max().clamp_min(1e-8)
+ 
+ 
+def apply_desc_transform(fft_mean: torch.Tensor, transform: str,
+                         hp_radius: float = 0.25,
+                         eps: float = 1e-8) -> Tuple[torch.Tensor, str]:
+    """Rebalance the per-channel mean |FFT| magnitude BEFORE descriptor reduction.
+ 
+    fft_mean : [C, H, W] mean magnitude spectrum, fftshifted (DC at center).
+    transform: one of {none, log, log_nodc, radial_ramp, highpass}.
+    hp_radius: for 'highpass', fraction of r_max below which freqs are zeroed.
+ 
+    Returns (transformed [C,H,W], human-readable info string).
+    """
     C, H, W = fft_mean.shape
+    dc_y, dc_x = H // 2, W // 2          # DC bin after fftshift
+    x = fft_mean
+ 
+    if transform == 'none':
+        return x, "raw |FFT| magnitude (no transform)"
+ 
+    if transform == 'log':
+        return torch.log1p(x), "log1p(|FFT|): low-freq peak squashed, all info kept"
+ 
+    if transform == 'log_nodc':
+        x = torch.log1p(x).clone()
+        x[:, dc_y, dc_x] = 0.0
+        return x, "log1p(|FFT|) with DC bin zeroed (loudness term removed)"
+ 
+    if transform == 'radial_ramp':
+        r, rmax = _radius_grid(H, W, fft_mean.device)
+        ramp = (r / rmax).to(fft_mean.dtype)                   # 0 at DC -> 1 at edge
+        x = torch.log1p(x) * ramp.view(1, H, W)
+        return x, "log1p(|FFT|) * (r/r_max): soft high-pass, low freq down-weighted"
+ 
+    if transform == 'highpass':
+        r, rmax = _radius_grid(H, W, fft_mean.device)
+        keep = (r >= hp_radius * rmax).to(fft_mean.dtype)      # 0 inside the disk
+        x = torch.log1p(x) * keep.view(1, H, W)
+        return (x, f"hard high-pass: log1p(|FFT|), low-freq disk "
+                   f"(r<{hp_radius:.2f}*r_max) zeroed")
+ 
+    raise ValueError(f"Unknown desc_transform: {transform}")
+ 
+ 
+def build_descriptor(fft_mean: torch.Tensor, mode: str, n_rbin: int,
+                     desc_transform: str = 'none',
+                     hp_radius: float = 0.25) -> Tuple[torch.Tensor, str]:
+    """fft_mean: [C, H, W] mean magnitude spectrum (fftshifted).
+    Applies desc_transform first, then reduces to full / radial.
+    Returns (descriptor [C, n_feat], human-readable feature description)."""
+    fft_t, t_info = apply_desc_transform(fft_mean, desc_transform,
+                                         hp_radius=hp_radius)
+    C, H, W = fft_t.shape
     if mode == 'full':
-        desc = fft_mean.reshape(C, -1)                          # [C, H*W]
-        return desc, f"full |FFT| magnitude flattened ({H}x{W}={H*W} feats)"
+        desc = fft_t.reshape(C, -1)                            # [C, H*W]
+        return desc, f"full mag flattened ({H}x{W}={H*W} feats) | {t_info}"
     elif mode == 'radial':
-        idx_flat, counts = radial_profile_bins(H, W, n_rbin,
-                                               device=fft_mean.device)
-        flat = fft_mean.reshape(C, -1)                          # [C, H*W]
+        # radial_profile_bins is defined in export_fft_basics.py; reuse it.
+        idx_flat, counts = radial_profile_bins(H, W, n_rbin,   # noqa: F821
+                                               device=fft_t.device)
+        flat = fft_t.reshape(C, -1)
         prof = torch.zeros(C, n_rbin, dtype=flat.dtype, device=flat.device)
-        prof.index_add_(1, idx_flat, flat)                      # sum per ring
-        prof = prof / counts.view(1, -1)                        # mean per ring
-        return prof, f"rotation-invariant radial profile ({n_rbin} bins)"
+        prof.index_add_(1, idx_flat, flat)
+        prof = prof / counts.view(1, -1)
+        return prof, f"radial profile ({n_rbin} bins) | {t_info}"
     else:
         raise ValueError(f"Unknown descriptor mode: {mode}")
-
+ 
 
 # ==========================================
 # Clustering -> (membership [C,k], centers [k,n_feat], labels [C])
@@ -873,6 +932,15 @@ def main():
                     help="SEPARATE .npz: fft_mean, descriptor, labels, "
                          "membership, centers, channel_mean, channel_scale, "
                          "meta.")
+    ap.add_argument('--desc_transform', type=str, default='none',
+                  choices=['none', 'log', 'log_nodc', 'radial_ramp', 'highpass'],
+                  help="Rebalance |FFT| before clustering. none=raw; "
+                       "log=log1p; log_nodc=log+drop DC; radial_ramp=soft "
+                       "high-pass; highpass=hard high-pass (see --hp_radius).")
+    ap.add_argument('--hp_radius', type=float, default=0.25,
+                  help="For --desc_transform highpass: low-freq disk radius "
+                       "as a fraction of r_max to zero out.")
+
     args = ap.parse_args()
 
     if args.device == 'auto':
@@ -949,9 +1017,8 @@ def main():
 
     # ---- build descriptor ----
     descriptor, desc_info = build_descriptor(
-        fft_mean, mode=args.descriptor, n_rbin=args.n_rbin)
-    print(f"  descriptor: {tuple(descriptor.shape)}  [{desc_info}]")
-
+       fft_mean, mode=args.descriptor, n_rbin=args.n_rbin,
+       desc_transform=args.desc_transform, hp_radius=args.hp_radius)
     # ---- cluster ----
     k = max(0, min(int(args.k), C))
     if k != args.k:
@@ -986,6 +1053,8 @@ def main():
         'invariance': ('translation (exact); orientation KEPT'
                        if args.descriptor == 'full'
                        else 'translation + rotation'),
+        'desc_transform': args.desc_transform,
+        'hp_radius': args.hp_radius if args.desc_transform == 'highpass' else None,              
     }
     save_fft_npz(args.save_fft, fft_mean, descriptor, labels, membership,
                  centers, mu, scales, meta)
