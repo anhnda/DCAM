@@ -8,6 +8,13 @@ percentile, and writes the gcmap1 cache.
 
 No training. No PCA. No SAE. Just the cache.
 
+A --skip_grad mode (ON by default) skips GradCAM entirely: it only runs the
+forward pass to capture activations, and fills the mask/gradcam_map fields
+with neutral placeholders (mask = all True, gradcam_map = uniform). The cache
+keeps the SAME interface (identical keys, dtypes, and shapes) so the downstream
+pipeline keeps working unchanged. Pass --no_skip_grad to compute real GradCAM
+masks and maps.
+
 Output (same layout as run_xcsae_full.py)
 -----------------------------------------
     cache_activations/activations_<cache_key>/
@@ -21,6 +28,10 @@ cache_key is
 e.g.
     resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1
 
+When --skip_grad is active the key gets a trailing _nograd marker so the two
+cache flavors never collide on disk:
+    resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1_nograd
+
 Each part_*.pkl is a dict with keys: 'activation' [n, C, H, W],
 'mask' [n, C] bool, 'label' [n], 'gradcam_map' [n, H, W] (sums to 1
 per image). The cache is BYTE-COMPATIBLE with the cache run_xcsae_full.py
@@ -33,13 +44,17 @@ External modules used (same strategy as run_xcsae_full.py):
 USAGE
 -----
   # default: resnet50 layer3, threshold 0.95, 50 imgs/class -> 50000 samples
+  # (GradCAM SKIPPED by default -- activations only)
   python export_activation_cache.py
 
-  # explicit
-  python export_activation_cache.py \\
-      --model resnet50 --target_layer layer3 \\
-      --cumulative_threshold 0.95 \\
+  # explicit, activations only (default behavior)
+  python export_activation_cache.py \
+      --model resnet50 --target_layer layer3 \
       --images_per_class 50
+
+  # compute real GradCAM masks + maps (original behavior)
+  python export_activation_cache.py --no_skip_grad \
+      --cumulative_threshold 0.95
 
   # other backbones
   python export_activation_cache.py --model resnet18
@@ -248,22 +263,30 @@ class ImageNet1kSampledDataset(Dataset):
 
 
 # ==========================================
-# Activation Extractor (with GradCAM map caching)
+# Activation Extractor (with optional GradCAM map caching)
 # (verbatim logic from run_xcsae_full.py:
 #  MultiModelActivationExtractor)
 # ==========================================
 
 class ActivationExtractor:
-    """Extracts activation channels AND the spatial Grad-CAM map per image,
-    writes byte-compatible gcmap1 cache."""
+    """Extracts activation channels AND (optionally) the spatial Grad-CAM map
+    per image, writes byte-compatible gcmap1 cache.
+
+    When skip_grad=True, GradCAM is not computed at all. The mask is filled
+    with all-True (every channel "selected") and the gradcam_map is filled with
+    a uniform distribution that still sums to 1 per image. The on-disk schema
+    (keys/dtypes/shapes) is identical, so downstream consumers are unaffected.
+    """
 
     def __init__(self, model_name: str = 'resnet50',
                  target_layer: str = None,
                  device='cuda', cumulative_threshold=0.95,
-                 cache_dir: Path = None):
+                 cache_dir: Path = None,
+                 skip_grad: bool = True):
         self.device = device
         self.cumulative_threshold = cumulative_threshold
         self.model_name = model_name
+        self.skip_grad = skip_grad
         self.cache_dir = cache_dir or ACTIVATION_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,10 +301,11 @@ class ActivationExtractor:
 
         print(f"\n{'='*80}")
         print(f"Initializing {model_name.upper()} Activation Extractor "
-              f"(with Grad-CAM map caching)")
+              f"({'NO GradCAM -- activations only' if skip_grad else 'with Grad-CAM map caching'})")
         print(f"{'='*80}")
         print(f"Model: {config['description']}")
         print(f"Target layer: {self.target_layer_name}")
+        print(f"Skip GradCAM: {self.skip_grad}")
         print(f"Cache directory: {self.cache_dir}")
 
         self.model = config['model_fn']().to(device)
@@ -299,7 +323,9 @@ class ActivationExtractor:
         print(f"  Spatial resolution: "
               f"{self.spatial_size}x{self.spatial_size}")
 
-        self.gradcam = GradCAM(self.model, self.target_layer)
+        # Only build the GradCAM helper when we actually need it.
+        self.gradcam = (None if self.skip_grad
+                        else GradCAM(self.model, self.target_layer))
 
         self.activations = None
         self.target_layer.register_forward_hook(self._save_activation)
@@ -345,6 +371,20 @@ class ActivationExtractor:
 
     def _save_activation(self, module, input, output):
         self.activations = output.detach()
+
+    def _neutral_mask_and_map(self) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        """Placeholder channel mask + gradcam map used when skip_grad=True.
+
+        mask        : all-True [C] bool  (every channel "selected")
+        num_selected: C
+        gradcam_map : uniform [H, W] float summing to 1
+        """
+        channel_mask = torch.ones(
+            self.num_channels, dtype=torch.bool, device=self.device)
+        h = w = self.spatial_size
+        gradcam_map = torch.full(
+            (h, w), 1.0 / (h * w), device=self.device)
+        return channel_mask, self.num_channels, gradcam_map
 
     def _select_channels_and_gradcam_map(
             self, image: torch.Tensor, class_idx: int = None
@@ -392,6 +432,10 @@ class ActivationExtractor:
             f"gcmap1"
         )
         config_str = config_str.replace('[', '_').replace(']', '').replace('.', 'p')
+        # Keep skip-grad caches on a separate key so the two flavors never
+        # overwrite each other. The schema is identical either way.
+        if self.skip_grad:
+            config_str += "_nograd"
         return config_str
 
     def _save_chunk_part(self, cache_key: str, part_idx: int,
@@ -417,7 +461,7 @@ class ActivationExtractor:
         cache_size_mb = total_size / (1024 * 1024)
         print(f"  Total cache size: {cache_size_mb:.1f} MB")
         print(f"  Number of parts: {metadata['num_chunks']}")
-        print(f"Activations + Grad-CAM maps cached!")
+        print(f"Activations{'' if self.skip_grad else ' + Grad-CAM maps'} cached!")
 
     def _check_cache_exists(self, cache_key: str) -> bool:
         cache_dir = self.cache_dir / f"activations_{cache_key}"
@@ -448,11 +492,16 @@ class ActivationExtractor:
         total_processed = 0
         chunk_idx = 0
 
-        print(f"\nCollecting activation maps + Grad-CAM maps "
+        print(f"\nCollecting activation maps"
+              f"{'' if self.skip_grad else ' + Grad-CAM maps'} "
               f"(streaming to disk)...")
         print(f"  Chunk size: {chunk_size} images")
-        print(f"  GradCAM threshold: "
-              f"{self.cumulative_threshold * 100:.0f}%")
+        if self.skip_grad:
+            print(f"  GradCAM: SKIPPED (mask=all-True, "
+                  f"gradcam_map=uniform placeholder)")
+        else:
+            print(f"  GradCAM threshold: "
+                  f"{self.cumulative_threshold * 100:.0f}%")
         print(f"  Output: {cache_dir}")
 
         for images, labels in tqdm(data_loader, desc="Extracting"):
@@ -464,8 +513,12 @@ class ActivationExtractor:
                     _ = self.model(image)
                     activations = self.activations.clone()
 
-                channel_mask, num_selected, gradcam_map = \
-                    self._select_channels_and_gradcam_map(image)
+                if self.skip_grad:
+                    channel_mask, num_selected, gradcam_map = \
+                        self._neutral_mask_and_map()
+                else:
+                    channel_mask, num_selected, gradcam_map = \
+                        self._select_channels_and_gradcam_map(image)
                 channel_selection_stats.append(num_selected)
 
                 chunk_activations.append(activations.cpu())
@@ -513,6 +566,7 @@ class ActivationExtractor:
             'total_samples': total_processed,
             'num_chunks': chunk_idx,
             'has_gradcam_map': True,
+            'skip_grad': self.skip_grad,
         }
         self._save_metadata(cache_key, metadata)
         return cache_dir, cache_key
@@ -559,7 +613,7 @@ def main():
                              "(see MODEL_CONFIGS).")
     parser.add_argument('--cumulative_threshold', type=float, default=0.95,
                         help="GradCAM cumulative-weight threshold for "
-                             "channel selection.")
+                             "channel selection (ignored when --skip_grad).")
     parser.add_argument('--images_per_class', type=int,
                         default=IMAGES_PER_CLASS)
     parser.add_argument('--chunk_size', type=int,
@@ -575,6 +629,20 @@ def main():
                              "random.sample in create_sampled_dataset).")
     parser.add_argument('--cache_dir', type=str,
                         default=str(ACTIVATION_CACHE_DIR))
+
+    # --skip_grad is ON by default. Use --no_skip_grad to compute real GradCAM.
+    grad_group = parser.add_mutually_exclusive_group()
+    grad_group.add_argument(
+        '--skip_grad', dest='skip_grad', action='store_true',
+        help="Only cache activations; skip GradCAM/scoring entirely. "
+             "mask is filled all-True and gradcam_map uniform so the cache "
+             "keeps the same interface. (DEFAULT)")
+    grad_group.add_argument(
+        '--no_skip_grad', dest='skip_grad', action='store_false',
+        help="Compute real GradCAM channel masks and spatial maps "
+             "(original behavior).")
+    parser.set_defaults(skip_grad=True)
+
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -582,6 +650,7 @@ def main():
     print("Activation Cache Extractor (standalone)")
     print(f"Backbone: {args.model.upper()}")
     print(f"Device: {device}")
+    print(f"Mode: {'ACTIVATIONS ONLY (skip_grad)' if args.skip_grad else 'ACTIVATIONS + GRADCAM'}")
     print("="*80)
 
     set_seed(args.data_seed)
@@ -610,6 +679,7 @@ def main():
         device=device,
         cumulative_threshold=args.cumulative_threshold,
         cache_dir=Path(args.cache_dir),
+        skip_grad=args.skip_grad,
     )
 
     cache_dir, cache_key = extractor.extract(
