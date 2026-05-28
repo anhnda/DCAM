@@ -56,7 +56,7 @@ Usage
   # 1) build the rank-D PCA reconstructor from the cache
   python csae_pca_baseline.py \
       --cache_dir cache_activations \
-      --cache_key resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
+      --cache_key activations_resnet50_layer3_thresh0p95_samples50000_chunk100_gcmap1 \
       --D 200 --device cuda --save pca_baseline_resnet50_D200_model.pkl
 
   # 2) evaluate it with the SAME fixed eval used for CSAE
