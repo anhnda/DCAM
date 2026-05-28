@@ -168,7 +168,14 @@ def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
                    ) -> Tuple[torch.Tensor, List[set]]:
     """Deterministic k-sparse deflation. Returns V [C, D] (unit-norm sparse
     columns) and a list of support sets. No RNG -> bitwise deterministic in
-    Sigma."""
+    Sigma.
+
+    Each refined atom is orthogonalized against previously accepted atoms
+    (vectorized Gram-Schmidt) before deflation, then re-restricted to its
+    support to keep it sparse. This prevents near-duplicate atoms (the
+    projection-deflation of a sparse-refined v, which is not an exact
+    eigenvector of S, otherwise leaves the leading direction partly in the
+    residual and the next iteration re-selects it)."""
     C = cov.shape[0]
     S = cov.clone()
     V = torch.zeros(C, D, dtype=cov.dtype, device=cov.device)
@@ -183,13 +190,25 @@ def sparse_deflate(cov: torch.Tensor, D: int, energy_target: float,
         v = torch.zeros(C, dtype=cov.dtype, device=cov.device)
         v[sup] = Qs[:, -1]                                # optimal within support
         v = v / v.norm().clamp_min(1e-12)
+
+        # --- orthogonalize against accepted atoms (vectorized GS, 2 passes) ---
+        if d > 0:
+            Vd = V[:, :d]                                 # [C, d]
+            v = v - Vd @ (Vd.T @ v)
+            v = v - Vd @ (Vd.T @ v)                       # reorthogonalize
+            # re-restrict to support to keep the atom sparse, renormalize
+            mask = torch.zeros_like(v)
+            mask[sup] = 1.0
+            v = v * mask
+            v = v / v.norm().clamp_min(1e-12)
+        # ----------------------------------------------------------------------
+
         V[:, d] = v
         sups.append(set(sup.tolist()))
         P = eye - torch.outer(v, v)                       # projection deflation
         S = P @ S @ P
         S = 0.5 * (S + S.T)                               # keep symmetric/PSD
     return V, sups
-
 
 # ==========================================================================
 # Bootstrap covariance samplers
